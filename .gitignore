@@ -1,0 +1,24 @@
+# STM32CubeIDE / Eclipse build directories
+/Debug/
+/Release/
+*.elf
+*.map
+*.hex
+*.bin
+
+# IDE specific files and metadata
+.metadata/
+.settings/
+.launch/
+*.launch
+*.project
+*.cproject
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+.DS_Store
