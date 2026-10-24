@@ -10,9 +10,6 @@
 .metadata/
 .settings/
 .launch/
-*.launch
-*.project
-*.cproject
 
 # OS generated files
 Thumbs.db
