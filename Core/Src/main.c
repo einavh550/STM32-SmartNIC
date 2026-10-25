@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ring_buffer_test.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -140,6 +140,10 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+#ifdef RB_SELF_TEST
+  BSP_LED_On((rb_self_test() == 0u) ? LED_GREEN : LED_RED);
+#endif
+
   while (1)
   {
 
