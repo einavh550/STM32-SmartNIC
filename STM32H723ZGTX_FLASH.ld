@@ -166,6 +166,18 @@ SECTIONS
     . = ALIGN(8);
   } >RAM_D1
 
+  /* Ethernet DMA descriptors: placed in D2 SRAM, close to the ETH peripheral.
+   * NOLOAD = nothing is copied from flash at startup; HAL_ETH_Init() fills them. */
+  .RxDescripSection (NOLOAD) : ALIGN(32)
+  {
+    *(.RxDescripSection)
+  } >RAM_D2
+
+  .TxDescripSection (NOLOAD) : ALIGN(32)
+  {
+    *(.TxDescripSection)
+  } >RAM_D2
+
   /* Remove information from the standard libraries */
   /DISCARD/ :
   {
