@@ -47,3 +47,39 @@ bool rb_push(ring_buffer_t *rb, const pkt_desc_t *desc)
     atomic_store_explicit(&rb->head, head + 1u, memory_order_release);
     return true;
 }
+
+bool rb_pop(ring_buffer_t *rb, pkt_desc_t *out)
+{
+    /* Our own index: only main writes tail, so no ordering is needed. */
+    const uint32_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+
+    /* The producer's index: acquire pairs with the release store in rb_push(),
+     * so the slot contents are visible before we read them. */
+    const uint32_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+
+    if (head == tail)
+    {
+        return false; /* Empty. *out is left untouched. */
+    }
+
+    /* Read the slot first ... */
+    *out = rb->buf[tail & RB_MASK];
+
+    /* ... then free it. Release guarantees the read above is finished
+     * before the producer can see the slot as free and overwrite it. */
+    atomic_store_explicit(&rb->tail, tail + 1u, memory_order_release);
+    return true;
+}
+
+uint32_t rb_count(const ring_buffer_t *rb)
+{
+    /* Snapshot only: no slot data is read, so relaxed is enough. */
+    const uint32_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+    const uint32_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+    return head - tail;
+}
+
+uint32_t rb_dropped(const ring_buffer_t *rb)
+{
+    return atomic_load_explicit(&rb->dropped, memory_order_relaxed);
+}
