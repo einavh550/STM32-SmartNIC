@@ -69,4 +69,42 @@ typedef struct
     _Atomic uint32_t dropped;          /**< Frames rejected because the ring was full. Written ONLY by producer. */
 } ring_buffer_t;
 
+/* ------------------------------------------------------------------------- */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief  Reset the ring to empty and clear the drop counter.
+ * @note   Call once from main BEFORE the ETH RX interrupt is enabled.
+ *         It is not safe to call while the producer or consumer is running.
+ */
+void rb_init(ring_buffer_t *rb);
+
+/**
+ * @brief  Copy one descriptor into the ring.
+ * @note   PRODUCER ONLY (ETH RX ISR). Never blocks.
+ * @return true if stored, false if the ring was full (dropped is incremented).
+ */
+bool rb_push(ring_buffer_t *rb, const pkt_desc_t *desc);
+
+/**
+ * @brief  Copy the oldest descriptor out of the ring into *out.
+ * @note   CONSUMER ONLY (main loop). Never blocks.
+ * @return true if *out was filled, false if the ring was empty (*out untouched).
+ */
+bool rb_pop(ring_buffer_t *rb, pkt_desc_t *out);
+
+/**
+ * @brief  Number of descriptors currently waiting in the ring.
+ * @note   Safe from either side, but only a snapshot: the other side may
+ *         change it immediately after it is read. Use for stats, not decisions.
+ */
+uint32_t rb_count(const ring_buffer_t *rb);
+
+/**
+ * @brief  Total frames rejected because the ring was full since rb_init().
+ * @note   Safe from either side.
+ */
+uint32_t rb_dropped(const ring_buffer_t *rb);
+
 #endif /* INC_RING_BUFFER_H_ */
