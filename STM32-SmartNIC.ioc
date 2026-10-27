@@ -71,6 +71,7 @@ NUCLEO-H723ZG.LD3=true
 NUCLEO-H723ZG.VCP=true
 NVIC.BusFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
 NVIC.DebugMonitor_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.ETH_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
 NVIC.EXTI15_10_IRQn=true\:0\:0\:false\:false\:true\:false\:true\:true
 NVIC.ForceEnableDMAVector=true
 NVIC.HardFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
