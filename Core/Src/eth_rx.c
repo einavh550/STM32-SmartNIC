@@ -105,3 +105,19 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
     *pStart = buff;
     *pEnd   = buff;
 }
+
+/* Called from ETH_IRQHandler -> HAL_ETH_IRQHandler() when the DMA has
+ * received at least one frame. Runs in INTERRUPT context: keep it short.
+ * One interrupt can stand for several frames (they may arrive faster than
+ * the CPU reacts), so drain them all. Each successful HAL_ETH_ReadData():
+ * - calls HAL_ETH_RxLinkCallback() above -> frame goes into pkt_ring,
+ * - refills the empty descriptor via HAL_ETH_RxAllocateCallback(). */
+void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
+{
+    void *frame;
+
+    while (HAL_ETH_ReadData(heth, &frame) == HAL_OK)
+    {
+        /* Nothing else to do: the link callback already queued the frame. */
+    }
+}
