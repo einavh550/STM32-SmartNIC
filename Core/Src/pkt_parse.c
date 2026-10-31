@@ -16,6 +16,13 @@ static uint16_t rd_be16(const uint8_t *p)
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
+/** Read a 32-bit big-endian (network order) value. */
+static uint32_t rd_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
 bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
 {
     /* Never read past the end of the frame. */
@@ -27,6 +34,40 @@ bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
     memcpy(out->dst_mac, &frame[0], ETH_MAC_LEN);
     memcpy(out->src_mac, &frame[6], ETH_MAC_LEN);
     out->ethertype = rd_be16(&frame[12]);
+
+    return true;
+}
+
+bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
+{
+    /* Room for at least the fixed 20-byte part of the header. */
+    if (len < ETH_HDR_LEN + IPV4_MIN_HDR_LEN)
+    {
+        return false;
+    }
+
+    const uint8_t *ip = &frame[ETH_HDR_LEN];
+
+    /* Byte 0 holds two 4-bit fields: version (high) and header length (low),
+     * where the length is counted in 32-bit words. */
+    const uint8_t  version = ip[0] >> 4;
+    const uint16_t hdr_len = (uint16_t)((ip[0] & 0x0Fu) * 4u);
+
+    if ((version != 4u) || (hdr_len < IPV4_MIN_HDR_LEN))
+    {
+        return false;
+    }
+
+    /* Options can make the header longer than 20 bytes: check it all fits. */
+    if (len < ETH_HDR_LEN + hdr_len)
+    {
+        return false;
+    }
+
+    out->ip_proto  = ip[9];
+    out->src_ip    = rd_be32(&ip[12]);
+    out->dst_ip    = rd_be32(&ip[16]);
+    out->l4_offset = (uint16_t)(ETH_HDR_LEN + hdr_len);
 
     return true;
 }

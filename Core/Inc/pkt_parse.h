@@ -23,6 +23,12 @@
 #define ETHERTYPE_ARP       (0x0806u)
 #define ETHERTYPE_IPV6      (0x86DDu)
 
+#define IPV4_MIN_HDR_LEN    (20u)   /**< IPv4 header without options.            */
+
+#define IP_PROTO_ICMP       (1u)
+#define IP_PROTO_TCP        (6u)
+#define IP_PROTO_UDP        (17u)
+
 /* ------------------------------------------------------------------------- */
 /* Types                                                                     */
 /* ------------------------------------------------------------------------- */
@@ -38,6 +44,12 @@ typedef struct
     uint8_t  dst_mac[ETH_MAC_LEN];
     uint8_t  src_mac[ETH_MAC_LEN];
     uint16_t ethertype;
+
+    /* IPv4, valid only after pkt_parse_ipv4() returned true. */
+    uint32_t src_ip;       /**< e.g. 192.168.1.5 is 0xC0A80105.                 */
+    uint32_t dst_ip;
+    uint8_t  ip_proto;     /**< What follows the IP header: TCP, UDP, ICMP...   */
+    uint16_t l4_offset;    /**< Offset of the TCP/UDP header from frame start.  */
 } pkt_hdr_t;
 
 /* ------------------------------------------------------------------------- */
@@ -52,5 +64,13 @@ typedef struct
  * @return true on success, false if the frame is too short (*out untouched).
  */
 bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
+/**
+ * @brief  Parse the IPv4 header that follows the Ethernet header.
+ * @note   Call only after pkt_parse_eth() succeeded and out->ethertype is IPv4.
+ *         VLAN-tagged frames are not supported yet.
+ * @return true on success, false if the header is truncated or invalid.
+ */
+bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 
 #endif /* INC_PKT_PARSE_H_ */

@@ -181,10 +181,24 @@ int main(void)
     {
       if (pkt_parse_eth(pkt.data, pkt.len, &hdr))
       {
-        printf("RX %4u bytes  type 0x%04X  src %02X:%02X:%02X:%02X:%02X:%02X\r\n",
-               (unsigned)pkt.len, (unsigned)hdr.ethertype,
-               hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
-               hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5]);
+        if ((hdr.ethertype == ETHERTYPE_IPV4) &&
+            pkt_parse_ipv4(pkt.data, pkt.len, &hdr))
+        {
+          printf("RX %4u bytes  IPv4  %u.%u.%u.%u -> %u.%u.%u.%u  proto %u\r\n",
+                 (unsigned)pkt.len,
+                 (unsigned)(hdr.src_ip >> 24), (unsigned)((hdr.src_ip >> 16) & 0xFFu),
+                 (unsigned)((hdr.src_ip >> 8) & 0xFFu), (unsigned)(hdr.src_ip & 0xFFu),
+                 (unsigned)(hdr.dst_ip >> 24), (unsigned)((hdr.dst_ip >> 16) & 0xFFu),
+                 (unsigned)((hdr.dst_ip >> 8) & 0xFFu), (unsigned)(hdr.dst_ip & 0xFFu),
+                 (unsigned)hdr.ip_proto);
+        }
+        else
+        {
+          printf("RX %4u bytes  type 0x%04X  src %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                 (unsigned)pkt.len, (unsigned)hdr.ethertype,
+                 hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
+                 hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5]);
+        }
       }
       else
       {
