@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "ring_buffer_test.h"
 #include "eth_rx.h"
+#include "pkt_parse.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -173,11 +174,24 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     pkt_desc_t pkt;
+    pkt_hdr_t  hdr;
 
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
-      printf("RX frame: %u bytes\r\n", (unsigned)pkt.len);
+      if (pkt_parse_eth(pkt.data, pkt.len, &hdr))
+      {
+        printf("RX %4u bytes  type 0x%04X  src %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+               (unsigned)pkt.len, (unsigned)hdr.ethertype,
+               hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
+               hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5]);
+      }
+      else
+      {
+        printf("RX %4u bytes  too short\r\n", (unsigned)pkt.len);
+      }
+
+      /* Always give the buffer back, even for a bad frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
     }
   }
