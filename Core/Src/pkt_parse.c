@@ -34,6 +34,7 @@ bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
     memcpy(out->dst_mac, &frame[0], ETH_MAC_LEN);
     memcpy(out->src_mac, &frame[6], ETH_MAC_LEN);
     out->ethertype = rd_be16(&frame[12]);
+    out->valid     = PKT_HAS_ETH;   /* new frame: forget the upper layers of the last one */
 
     return true;
 }
@@ -71,6 +72,7 @@ bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
 
     /* Bytes 6-7: 3 flag bits, then a 13-bit fragment offset. */
     out->ip_frag_off = rd_be16(&ip[6]) & 0x1FFFu;
+    out->valid      |= PKT_HAS_IPV4;
 
     return true;
 }
@@ -109,6 +111,7 @@ bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
 
     out->src_port = rd_be16(&l4[0]);
     out->dst_port = rd_be16(&l4[2]);
+    out->valid   |= PKT_HAS_L4;
 
     return true;
 }

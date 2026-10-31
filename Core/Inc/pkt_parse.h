@@ -32,6 +32,11 @@
 #define UDP_HDR_LEN         (8u)
 #define TCP_MIN_HDR_LEN     (20u)   /**< TCP header without options.             */
 
+/* Bits of pkt_hdr_t.valid: which layers were parsed successfully. */
+#define PKT_HAS_ETH         (1u << 0)
+#define PKT_HAS_IPV4        (1u << 1)
+#define PKT_HAS_L4          (1u << 2)
+
 /* ------------------------------------------------------------------------- */
 /* Types                                                                     */
 /* ------------------------------------------------------------------------- */
@@ -47,6 +52,7 @@ typedef struct
     uint8_t  dst_mac[ETH_MAC_LEN];
     uint8_t  src_mac[ETH_MAC_LEN];
     uint16_t ethertype;
+    uint8_t  valid;        /**< PKT_HAS_* bits: which fields below can be trusted. */
 
     /* IPv4, valid only after pkt_parse_ipv4() returned true. */
     uint32_t src_ip;       /**< e.g. 192.168.1.5 is 0xC0A80105.                 */

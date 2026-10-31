@@ -25,6 +25,7 @@
 #include "ring_buffer_test.h"
 #include "eth_rx.h"
 #include "pkt_parse.h"
+#include "pkt_filter.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,7 +35,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,7 +68,29 @@ COM_InitTypeDef BspCOMInit;
 ETH_HandleTypeDef heth;
 
 /* USER CODE BEGIN PV */
+/* Filter rules, checked top to bottom, first match wins.
+ * Chosen to match the traffic a Windows PC sends on a direct cable. */
+static const pkt_rule_t filter_rules[] =
+{
+  /* 0: drop Windows NetBIOS name broadcasts */
+  { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 137u,
+    .action = PKT_DROP },
+  /* 1: pass ARP */
+  { .match = RULE_ETHERTYPE, .ethertype = ETHERTYPE_ARP,
+    .action = PKT_PASS },
+  /* 2: pass DHCP requests (client -> server port 67) */
+  { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 67u,
+    .action = PKT_PASS },
+};
 
+#define FILTER_RULE_COUNT   (sizeof(filter_rules) / sizeof(filter_rules[0]))
+#define FILTER_DEFAULT      PKT_DROP
+
+/* Counters, written only by the main loop. */
+static uint32_t rule_hits[FILTER_RULE_COUNT];
+static uint32_t default_hits;
+static uint32_t frames_passed;
+static uint32_t frames_dropped;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,7 +99,8 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_action_t action, int32_t rule_idx);
+static void print_stats(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -173,46 +197,66 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t last_stats_ms;
     pkt_desc_t pkt;
     pkt_hdr_t  hdr;
 
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
+      pkt_action_t action;
+      int32_t      rule_idx;
+
+      /* 1. Parse as many layers as the frame has. Each step needs the one before. */
       if (pkt_parse_eth(pkt.data, pkt.len, &hdr))
       {
-        if ((hdr.ethertype == ETHERTYPE_IPV4) &&
-            pkt_parse_ipv4(pkt.data, pkt.len, &hdr))
+        if ((hdr.ethertype == ETHERTYPE_IPV4) && pkt_parse_ipv4(pkt.data, pkt.len, &hdr))
         {
-          printf("RX %4u bytes  IPv4  %u.%u.%u.%u -> %u.%u.%u.%u  proto %u",
-                 (unsigned)pkt.len,
-                 (unsigned)(hdr.src_ip >> 24), (unsigned)((hdr.src_ip >> 16) & 0xFFu),
-                 (unsigned)((hdr.src_ip >> 8) & 0xFFu), (unsigned)(hdr.src_ip & 0xFFu),
-                 (unsigned)(hdr.dst_ip >> 24), (unsigned)((hdr.dst_ip >> 16) & 0xFFu),
-                 (unsigned)((hdr.dst_ip >> 8) & 0xFFu), (unsigned)(hdr.dst_ip & 0xFFu),
-                 (unsigned)hdr.ip_proto);
+          (void)pkt_parse_l4(pkt.data, pkt.len, &hdr);   /* fails for ICMP etc.: fine */
+        }
 
-          if (pkt_parse_l4(pkt.data, pkt.len, &hdr))
-          {
-            printf("  ports %u -> %u", (unsigned)hdr.src_port, (unsigned)hdr.dst_port);
-          }
-          printf("\r\n");
-        }
-        else
-        {
-          printf("RX %4u bytes  type 0x%04X  src %02X:%02X:%02X:%02X:%02X:%02X\r\n",
-                 (unsigned)pkt.len, (unsigned)hdr.ethertype,
-                 hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
-                 hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5]);
-        }
+        /* 2. Ask the filter. */
+        action = pkt_filter_eval(filter_rules, FILTER_RULE_COUNT, FILTER_DEFAULT,
+                                 &hdr, &rule_idx);
       }
       else
       {
-        printf("RX %4u bytes  too short\r\n", (unsigned)pkt.len);
+        /* Shorter than an Ethernet header: nothing to filter on. */
+        hdr.valid = 0u;
+        action    = PKT_DROP;
+        rule_idx  = -1;
       }
 
-      /* Always give the buffer back, even for a bad frame, or the pool leaks. */
+      /* 3. Count. */
+      if (rule_idx >= 0)
+      {
+        rule_hits[rule_idx]++;
+      }
+      else
+      {
+        default_hits++;
+      }
+
+      if (action == PKT_PASS)
+      {
+        frames_passed++;
+      }
+      else
+      {
+        frames_dropped++;
+      }
+
+      log_frame(pkt.len, &hdr, action, rule_idx);
+
+      /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
+    }
+
+    /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
+    if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
+    {
+      last_stats_ms = HAL_GetTick();
+      print_stats();
     }
   }
   /* USER CODE END 3 */
@@ -339,7 +383,56 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/** Print one line per frame: what it is and what the filter decided. */
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_action_t action, int32_t rule_idx)
+{
+  printf("RX %4u  ", (unsigned)len);
 
+  if ((hdr->valid & PKT_HAS_IPV4) != 0u)
+  {
+    printf("IPv4 %u.%u.%u.%u -> %u.%u.%u.%u p%u",
+           (unsigned)(hdr->src_ip >> 24), (unsigned)((hdr->src_ip >> 16) & 0xFFu),
+           (unsigned)((hdr->src_ip >> 8) & 0xFFu), (unsigned)(hdr->src_ip & 0xFFu),
+           (unsigned)(hdr->dst_ip >> 24), (unsigned)((hdr->dst_ip >> 16) & 0xFFu),
+           (unsigned)((hdr->dst_ip >> 8) & 0xFFu), (unsigned)(hdr->dst_ip & 0xFFu),
+           (unsigned)hdr->ip_proto);
+
+    if ((hdr->valid & PKT_HAS_L4) != 0u)
+    {
+      printf(" %u->%u", (unsigned)hdr->src_port, (unsigned)hdr->dst_port);
+    }
+  }
+  else if ((hdr->valid & PKT_HAS_ETH) != 0u)
+  {
+    printf("type 0x%04X", (unsigned)hdr->ethertype);
+  }
+  else
+  {
+    printf("too short");
+  }
+
+  if (rule_idx >= 0)
+  {
+    printf("  => %s (rule %ld)\r\n", (action == PKT_PASS) ? "PASS" : "DROP", (long)rule_idx);
+  }
+  else
+  {
+    printf("  => %s (default)\r\n", (action == PKT_PASS) ? "PASS" : "DROP");
+  }
+}
+
+/** Print the filter counters. */
+static void print_stats(void)
+{
+  printf("--- passed %lu  dropped %lu  |", (unsigned long)frames_passed, (unsigned long)frames_dropped);
+
+  for (uint32_t i = 0u; i < FILTER_RULE_COUNT; i++)
+  {
+    printf("  r%lu:%lu", (unsigned long)i, (unsigned long)rule_hits[i]);
+  }
+
+  printf("  default:%lu ---\r\n", (unsigned long)default_hits);
+}
 /* USER CODE END 4 */
 
  /* MPU Configuration */
