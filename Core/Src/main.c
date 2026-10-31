@@ -22,7 +22,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ring_buffer_test.h"
+#include "eth_rx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,6 +97,14 @@ int main(void)
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
 
+  /* Enable the CPU Cache */
+
+  /* Enable I-Cache---------------------------------------------------------*/
+  SCB_EnableICache();
+
+  /* Enable D-Cache---------------------------------------------------------*/
+  SCB_EnableDCache();
+
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -140,12 +149,37 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+#ifdef RB_SELF_TEST
+  BSP_LED_On((rb_self_test() == 0u) ? LED_GREEN : LED_RED);
+#endif
+
+  /* Start Ethernet RX. Done here (not in USER CODE 2) so the COM port is
+   * already up and printf works. Order matters:
+   * 1. eth_rx_init() fills the free list,
+   * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
+   *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
+  eth_rx_init();
+  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+  {
+    printf("ETH start failed\r\n");
+    Error_Handler();
+  }
+  printf("ETH RX started\r\n");
+
   while (1)
   {
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    pkt_desc_t pkt;
+
+    /* Consumer side: take every frame the ISR queued, then give the buffer back. */
+    while (eth_rx_pop(&pkt))
+    {
+      printf("RX frame: %u bytes\r\n", (unsigned)pkt.len);
+      eth_rx_buf_free(pkt.data);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -296,6 +330,18 @@ void MPU_Config(void)
   MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
+  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
+  MPU_InitStruct.BaseAddress = 0x30000000;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_32KB;
+  MPU_InitStruct.SubRegionDisable = 0x0;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL1;
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
   /* Enables the MPU */

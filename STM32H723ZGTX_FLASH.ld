@@ -166,6 +166,25 @@ SECTIONS
     . = ALIGN(8);
   } >RAM_D1
 
+  /* Ethernet DMA descriptors: placed in D2 SRAM, close to the ETH peripheral.
+   * NOLOAD = nothing is copied from flash at startup; HAL_ETH_Init() fills them. */
+  .RxDescripSection (NOLOAD) : ALIGN(32)
+  {
+    *(.RxDescripSection)
+  } >RAM_D2
+
+  .TxDescripSection (NOLOAD) : ALIGN(32)
+  {
+    *(.TxDescripSection)
+  } >RAM_D2
+
+  /* Ethernet RX buffer pool: the DMA writes received frames here.
+   * D2 SRAM is marked non-cacheable by MPU region 1, so the CPU always sees what the DMA wrote. */
+  .RxBuffSection (NOLOAD) : ALIGN(32)
+  {
+    *(.RxBuffSection)
+  } >RAM_D2
+
   /* Remove information from the standard libraries */
   /DISCARD/ :
   {
