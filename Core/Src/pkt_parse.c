@@ -69,5 +69,46 @@ bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
     out->dst_ip    = rd_be32(&ip[16]);
     out->l4_offset = (uint16_t)(ETH_HDR_LEN + hdr_len);
 
+    /* Bytes 6-7: 3 flag bits, then a 13-bit fragment offset. */
+    out->ip_frag_off = rd_be16(&ip[6]) & 0x1FFFu;
+
+    return true;
+}
+
+bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
+{
+    uint16_t min_hdr_len;
+
+    if (out->ip_proto == IP_PROTO_UDP)
+    {
+        min_hdr_len = UDP_HDR_LEN;
+    }
+    else if (out->ip_proto == IP_PROTO_TCP)
+    {
+        min_hdr_len = TCP_MIN_HDR_LEN;
+    }
+    else
+    {
+        return false;
+    }
+
+    /* Only the first fragment of a split IP packet carries the TCP/UDP header.
+     * In the others, the bytes at l4_offset are payload, not ports. */
+    if (out->ip_frag_off != 0u)
+    {
+        return false;
+    }
+
+    if (len < out->l4_offset + min_hdr_len)
+    {
+        return false;
+    }
+
+    /* TCP and UDP both start with: source port (2 bytes), destination port (2 bytes). */
+    const uint8_t *l4 = &frame[out->l4_offset];
+
+    out->src_port = rd_be16(&l4[0]);
+    out->dst_port = rd_be16(&l4[2]);
+
     return true;
 }

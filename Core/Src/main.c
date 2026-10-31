@@ -184,13 +184,19 @@ int main(void)
         if ((hdr.ethertype == ETHERTYPE_IPV4) &&
             pkt_parse_ipv4(pkt.data, pkt.len, &hdr))
         {
-          printf("RX %4u bytes  IPv4  %u.%u.%u.%u -> %u.%u.%u.%u  proto %u\r\n",
+          printf("RX %4u bytes  IPv4  %u.%u.%u.%u -> %u.%u.%u.%u  proto %u",
                  (unsigned)pkt.len,
                  (unsigned)(hdr.src_ip >> 24), (unsigned)((hdr.src_ip >> 16) & 0xFFu),
                  (unsigned)((hdr.src_ip >> 8) & 0xFFu), (unsigned)(hdr.src_ip & 0xFFu),
                  (unsigned)(hdr.dst_ip >> 24), (unsigned)((hdr.dst_ip >> 16) & 0xFFu),
                  (unsigned)((hdr.dst_ip >> 8) & 0xFFu), (unsigned)(hdr.dst_ip & 0xFFu),
                  (unsigned)hdr.ip_proto);
+
+          if (pkt_parse_l4(pkt.data, pkt.len, &hdr))
+          {
+            printf("  ports %u -> %u", (unsigned)hdr.src_port, (unsigned)hdr.dst_port);
+          }
+          printf("\r\n");
         }
         else
         {
