@@ -59,6 +59,8 @@ typedef struct
     uint32_t dst_ip;
     uint8_t  ip_proto;     /**< What follows the IP header: TCP, UDP, ICMP...   */
     uint16_t l4_offset;    /**< Offset of the TCP/UDP header from frame start.  */
+    uint16_t ip_total_len; /**< IP header + payload, from the header. The frame
+                                can be longer (Ethernet padding), never shorter. */
     uint16_t ip_frag_off;  /**< Fragment offset in 8-byte units, 0 = first piece. */
 
     /* TCP/UDP, valid only after pkt_parse_l4() returned true. */
@@ -83,7 +85,8 @@ bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
  * @brief  Parse the IPv4 header that follows the Ethernet header.
  * @note   Call only after pkt_parse_eth() succeeded and out->ethertype is IPv4.
  *         VLAN-tagged frames are not supported yet.
- * @return true on success, false if the header is truncated or invalid.
+ * @return true on success, false if the header is truncated or invalid, or
+ *         its total length is smaller than the header or larger than the frame.
  */
 bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 
@@ -101,8 +104,9 @@ bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
  * A layer that is simply absent is fine (ARP has no IP header, ICMP has no
  * ports, a non-first fragment has no L4 header). A layer the frame CLAIMS to
  * have but that is broken makes the whole frame malformed: EtherType says IPv4
- * but the IPv4 header is invalid, or the protocol says TCP/UDP but that header
- * is truncated.
+ * but the IPv4 header is invalid, the protocol says TCP/UDP but that header
+ * does not fit in the IP packet (this includes tiny first fragments), or a TCP
+ * fragment sits at offset 1 (overlapping-fragment attack, RFC 1858).
  *
  * @return true if the frame is well formed (out->valid says which layers were
  *         found), false if it is malformed and should be dropped.

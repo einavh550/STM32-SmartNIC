@@ -86,7 +86,7 @@ static void test_ipv4_address_byte_order(void)
 static void test_ipv4_truncated_is_rejected(void)
 {
     pkt_hdr_t hdr;
-    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 0u);
 
     CHECK(pkt_parse_eth(frame, len, &hdr));
     CHECK(!pkt_parse_ipv4(frame, len - 1u, &hdr));   /* 19-byte IP header */
@@ -96,7 +96,7 @@ static void test_ipv4_truncated_is_rejected(void)
 static void test_ipv4_wrong_version_is_rejected(void)
 {
     pkt_hdr_t hdr;
-    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 0u);
 
     frame[ETH_HDR_LEN] = 0x65;                        /* version 6, IHL 5 */
     CHECK(pkt_parse_eth(frame, len, &hdr));
@@ -106,7 +106,7 @@ static void test_ipv4_wrong_version_is_rejected(void)
 static void test_ipv4_ihl_below_5_is_rejected(void)
 {
     pkt_hdr_t hdr;
-    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 0u);
 
     frame[ETH_HDR_LEN] = 0x44;                        /* IHL 4 = 16 bytes: impossible */
     CHECK(pkt_parse_eth(frame, len, &hdr));
@@ -118,8 +118,9 @@ static void test_ipv4_options_move_l4_offset(void)
     pkt_hdr_t hdr;
     uint8_t  *ip = &frame[ETH_HDR_LEN];
 
-    /* IHL 6: 20-byte header + 4 bytes of options. UDP starts at 14 + 24 = 38. */
-    build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    /* IHL 6: 20-byte header + 4 bytes of options. UDP starts at 14 + 24 = 38.
+     * Payload after the fixed 20 bytes: 4 option bytes + 8 UDP bytes. */
+    build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 4u + UDP_HDR_LEN);
     ip[0] = 0x46;
     memset(&ip[20], 0x01, 4);                         /* 4 x NOP option     */
     wr_be16(&frame[38], 5000u);                       /* UDP src port       */
@@ -136,7 +137,7 @@ static void test_ipv4_options_move_l4_offset(void)
 static void test_ipv4_options_past_end_are_rejected(void)
 {
     pkt_hdr_t hdr;
-    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    uint16_t  len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 0u);
 
     /* IHL 15 claims a 60-byte header, but the frame only has 20 IP bytes. */
     frame[ETH_HDR_LEN] = 0x4F;
@@ -201,7 +202,10 @@ static void test_l4_truncated_udp_is_rejected(void)
     pkt_hdr_t hdr;
     uint16_t  len = build_udp(frame, 1u, 2u, 1u, 2u);
 
-    CHECK(parse_all(frame, len - 1u, &hdr));          /* only 7 UDP bytes */
+    /* IP header is honest (total 27 = 20 + 7), but 7 bytes is no UDP header. */
+    wr_be16(&frame[ETH_HDR_LEN + 2], IPV4_MIN_HDR_LEN + 7u);
+    CHECK(parse_all(frame, len - 1u, &hdr));
+    CHECK(hdr.valid & PKT_HAS_IPV4);
     CHECK((hdr.valid & PKT_HAS_L4) == 0u);
 }
 
@@ -210,15 +214,114 @@ static void test_l4_short_tcp_is_rejected(void)
     pkt_hdr_t hdr;
     uint16_t  len = build_tcp(frame, 1u, 2u, 1u, 2u);
 
-    /* 8 bytes is enough for UDP, but TCP needs 20. */
+    /* 8 bytes is enough for UDP, but TCP needs 20. IP total = 20 + 8. */
+    wr_be16(&frame[ETH_HDR_LEN + 2], IPV4_MIN_HDR_LEN + 8u);
     CHECK(parse_all(frame, len - 12u, &hdr));
+    CHECK(hdr.valid & PKT_HAS_IPV4);
     CHECK((hdr.valid & PKT_HAS_L4) == 0u);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Step 2: IP total length sanity, RFC 1858 fragment attacks                 */
+/* ------------------------------------------------------------------------- */
+
+static void test_ipv4_total_len_below_header_is_rejected(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_udp(frame, 1u, 2u, 1u, 2u);
+
+    wr_be16(&frame[ETH_HDR_LEN + 2], 19u);            /* smaller than the 20-byte header */
+    CHECK(pkt_parse_eth(frame, len, &hdr));
+    CHECK(!pkt_parse_ipv4(frame, len, &hdr));
+}
+
+static void test_ipv4_total_len_past_frame_is_rejected(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_udp(frame, 1u, 2u, 1u, 2u); /* 28 IP bytes arrived */
+
+    wr_be16(&frame[ETH_HDR_LEN + 2], 1000u);          /* ...but it claims 1000 */
+    CHECK(pkt_parse_eth(frame, len, &hdr));
+    CHECK(!pkt_parse_ipv4(frame, len, &hdr));
+
+    wr_be16(&frame[ETH_HDR_LEN + 2], 29u);            /* off by one is still a lie */
+    CHECK(!pkt_parse_ipv4(frame, len, &hdr));
+
+    wr_be16(&frame[ETH_HDR_LEN + 2], 28u);            /* exact: fine */
+    CHECK(pkt_parse_ipv4(frame, len, &hdr));
+    CHECK_EQ(hdr.ip_total_len, 28u);
+}
+
+static void test_ipv4_ethernet_padding_is_allowed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_udp(frame, 1u, 2u, 68u, 67u);   /* 42 bytes */
+
+    /* The sender pads every frame shorter than 60 bytes. */
+    memset(&frame[len], 0, 60u - len);
+    CHECK(pkt_parse_frame(frame, 60u, &hdr));
+    CHECK_EQ(hdr.ip_total_len, 28u);                  /* padding is not IP data */
+    CHECK_EQ(hdr.dst_port, 67u);
+}
+
+static void test_l4_is_not_read_from_padding(void)
+{
+    pkt_hdr_t hdr;
+
+    /* IP says UDP but carries 0 payload bytes. The padding after it happens
+     * to look like ports; the parser must not read it as a UDP header. */
+    uint16_t len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 0u);  /* 34 bytes */
+    memset(&frame[len], 0, 60u - len);
+    wr_be16(&frame[34], 1234u);
+    wr_be16(&frame[36], 137u);
+
+    CHECK(!pkt_parse_frame(frame, 60u, &hdr));        /* says UDP, has no UDP: malformed */
+    CHECK((hdr.valid & PKT_HAS_L4) == 0u);
+}
+
+static void test_tiny_tcp_first_fragment_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_tcp(frame, 1u, 2u, 40000u, 22u);
+
+    /* First fragment (More Fragments set, offset 0) carrying only 8 TCP bytes:
+     * ports are here, the flags would come in the next fragment. */
+    wr_be16(&frame[ETH_HDR_LEN + 2], IPV4_MIN_HDR_LEN + 8u);
+    wr_be16(&frame[ETH_HDR_LEN + 6], 0x2000u);
+    CHECK(!pkt_parse_frame(frame, len - 12u, &hdr));
+
+    /* A first fragment carrying the full 20-byte TCP header is fine. */
+    len = build_tcp(frame, 1u, 2u, 40000u, 22u);
+    wr_be16(&frame[ETH_HDR_LEN + 6], 0x2000u);
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+}
+
+static void test_tcp_fragment_offset_1_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len;
+
+    /* TCP fragment at offset 1 (byte 8): overwrites the TCP flags. */
+    len = build_ipv4(frame, IP_PROTO_TCP, 1u, 2u, 12u);
+    memset(&frame[len], 0, 12u);
+    wr_be16(&frame[ETH_HDR_LEN + 6], 1u);
+    CHECK(!pkt_parse_frame(frame, len + 12u, &hdr));
+
+    /* Offset 2 or more is a normal later fragment. */
+    wr_be16(&frame[ETH_HDR_LEN + 6], 2u);
+    CHECK(pkt_parse_frame(frame, len + 12u, &hdr));
+
+    /* UDP at offset 1 is not this attack (UDP has no flags to overwrite). */
+    len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 12u);
+    memset(&frame[len], 0, 12u);
+    wr_be16(&frame[ETH_HDR_LEN + 6], 1u);
+    CHECK(pkt_parse_frame(frame, len + 12u, &hdr));
 }
 
 static void test_l4_icmp_has_no_ports(void)
 {
     pkt_hdr_t hdr;
-    uint16_t  len = build_ipv4(frame, IP_PROTO_ICMP, 1u, 2u);
+    uint16_t  len = build_ipv4(frame, IP_PROTO_ICMP, 1u, 2u, 8u);
 
     memset(&frame[len], 0, 8);                        /* echo request body */
     frame[len] = 8;
@@ -304,13 +407,13 @@ static void test_frame_icmp_and_fragment_are_fine(void)
     uint16_t  len;
 
     /* ICMP has no ports: not malformed. */
-    len = build_ipv4(frame, IP_PROTO_ICMP, 1u, 2u);
+    len = build_ipv4(frame, IP_PROTO_ICMP, 1u, 2u, 8u);
     memset(&frame[len], 0, 8);
     CHECK(pkt_parse_frame(frame, len + 8u, &hdr));
     CHECK_EQ(hdr.valid, PKT_HAS_ETH | PKT_HAS_IPV4);
 
     /* A later fragment has no UDP header, even if it is only 2 bytes long. */
-    len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u, 2u);
     wr_be16(&frame[ETH_HDR_LEN + 6], 185u);
     CHECK(pkt_parse_frame(frame, len + 2u, &hdr));
     CHECK_EQ(hdr.valid, PKT_HAS_ETH | PKT_HAS_IPV4);
@@ -347,4 +450,11 @@ void run_pkt_parse_tests(void)
     RUN_TEST(test_frame_broken_ipv4_is_malformed);
     RUN_TEST(test_frame_truncated_l4_is_malformed);
     RUN_TEST(test_frame_icmp_and_fragment_are_fine);
+
+    RUN_TEST(test_ipv4_total_len_below_header_is_rejected);
+    RUN_TEST(test_ipv4_total_len_past_frame_is_rejected);
+    RUN_TEST(test_ipv4_ethernet_padding_is_allowed);
+    RUN_TEST(test_l4_is_not_read_from_padding);
+    RUN_TEST(test_tiny_tcp_first_fragment_is_malformed);
+    RUN_TEST(test_tcp_fragment_offset_1_is_malformed);
 }

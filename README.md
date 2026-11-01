@@ -73,6 +73,13 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 - Every read is bounds-checked against the frame length; a truncated or
   inconsistent header (wrong version, IHL < 5, options past the end) is rejected.
 - IPv4 options are supported through the IHL field (`l4_offset = 14 + IHL * 4`).
+- The IPv4 total length is checked against the frame: smaller than the header,
+  or larger than what arrived, is malformed. A longer frame is accepted
+  (Ethernet pads short frames to 60 bytes), and the TCP/UDP header must fit
+  inside the IP packet, so padding bytes are never read as ports.
+- RFC 1858 fragment attacks are dropped as malformed: a first TCP fragment too
+  small to hold the full TCP header (tiny fragment), and a TCP fragment at
+  offset 1 that would overwrite the TCP flags (overlapping fragment).
 - Non-first IP fragments carry no L4 header, so no ports are read from them.
 - `pkt_hdr_t.valid` records which layers were parsed (`PKT_HAS_ETH/IPV4/L4`).
 - Pure C, no HAL: the same file is compiled for the board and for host tests.
@@ -82,8 +89,9 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   malformed frames before any rule sees them, then run the rule table.
   It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
 - A frame is malformed when a layer it claims to have is broken (EtherType
-  says IPv4 but the header is invalid, protocol says TCP/UDP but the header is
-  truncated). An absent layer is not an error (ARP, ICMP, later fragments).
+  says IPv4 but the header or its length is invalid, protocol says TCP/UDP but
+  the header does not fit, RFC 1858 fragments). An absent layer is not an
+  error (ARP, ICMP, later fragments).
 - Ordered rule table, first match wins, default action if nothing matches
   (like a firewall rule list).
 - A rule compares only the fields named in its `match` bits: EtherType,
@@ -126,9 +134,10 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
-- **Host unit tests:** 40 tests (167 checks) build `pkt_parse.c` and
+- **Host unit tests:** 46 tests (186 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
-  TCP, byte order, truncated and malformed headers, IPv4 options, fragments,
+  TCP, byte order, truncated and malformed headers, lying IP total length,
+  Ethernet padding, IPv4 options, fragments and RFC 1858 fragment attacks,
   first-match order, subnet masks, stale-field protection, the demo rule
   table end to end, and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
@@ -144,7 +153,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `167 checks, 0 failed: PASS`.
+Expected last line: `186 checks, 0 failed: PASS`.
 
 ## Build and flash
 

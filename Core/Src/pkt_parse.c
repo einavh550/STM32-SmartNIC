@@ -59,12 +59,22 @@ bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
         return false;
     }
 
-    /* Options can make the header longer than 20 bytes: check it all fits. */
-    if (len < ETH_HDR_LEN + hdr_len)
+    /* Bytes 2-3: total length = IP header + everything after it. It comes from
+     * the sender, so it can lie:
+     * - smaller than the header itself: impossible, the packet is broken;
+     * - larger than what arrived: the packet was cut, or someone wants us to
+     *   read past the end of the buffer.
+     * The frame MAY be longer than 14 + total_len: Ethernet pads short frames
+     * up to 60 bytes, and those padding bytes are not part of the packet.
+     * Since total_len >= hdr_len, this also checks that the options fit. */
+    const uint16_t total_len = rd_be16(&ip[2]);
+
+    if ((total_len < hdr_len) || (len < ETH_HDR_LEN + total_len))
     {
         return false;
     }
 
+    out->ip_total_len = total_len;
     out->ip_proto  = ip[9];
     out->src_ip    = rd_be32(&ip[12]);
     out->dst_ip    = rd_be32(&ip[16]);
@@ -101,7 +111,13 @@ bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
         return false;
     }
 
-    if (len < out->l4_offset + min_hdr_len)
+    /* The TCP/UDP header must fit inside the IP packet, not only inside the
+     * frame: otherwise we would read Ethernet padding bytes as ports.
+     * pkt_parse_ipv4() already checked ip_end <= len; checking again is cheap
+     * and keeps this function safe on its own. */
+    const uint16_t ip_end = (uint16_t)(ETH_HDR_LEN + out->ip_total_len);
+
+    if ((ip_end > len) || (ip_end < out->l4_offset + min_hdr_len))
     {
         return false;
     }
@@ -137,12 +153,23 @@ bool pkt_parse_frame(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
         return false;                 /* says IPv4, but the header is broken */
     }
 
+    /* Overlapping-fragment attack (RFC 1858): a TCP fragment at offset 1
+     * (= byte 8) rewrites the TCP flags of the first fragment after a
+     * firewall already checked them. No real sender does this. */
+    if ((out->ip_proto == IP_PROTO_TCP) && (out->ip_frag_off == 1u))
+    {
+        return false;
+    }
+
     const bool has_ports = ((out->ip_proto == IP_PROTO_TCP) || (out->ip_proto == IP_PROTO_UDP)) &&
                            (out->ip_frag_off == 0u);
 
     if (has_ports)
     {
-        return pkt_parse_l4(frame, len, out);   /* false = TCP/UDP header truncated */
+        /* false = the TCP/UDP header does not fit in the packet. For a first
+         * fragment this also blocks the "tiny fragment" attack (RFC 1858):
+         * a TCP header split so its flags land in the second fragment. */
+        return pkt_parse_l4(frame, len, out);
     }
 
     return true;                      /* ICMP, or a later fragment: no ports */

@@ -43,13 +43,16 @@ static inline uint16_t build_eth(uint8_t *f, uint16_t ethertype)
     return ETH_HDR_LEN;
 }
 
-/** Ethernet + 20-byte IPv4 header (no options). Returns 34 = start of L4. */
-static inline uint16_t build_ipv4(uint8_t *f, uint8_t proto, uint32_t src, uint32_t dst)
+/** Ethernet + 20-byte IPv4 header (no options) announcing payload_len bytes
+ *  after it (total length = 20 + payload_len). Returns 34 = start of L4. */
+static inline uint16_t build_ipv4(uint8_t *f, uint8_t proto, uint32_t src, uint32_t dst,
+                                  uint16_t payload_len)
 {
     uint8_t *ip = &f[build_eth(f, ETHERTYPE_IPV4)];
 
     memset(ip, 0, IPV4_MIN_HDR_LEN);
     ip[0] = 0x45;               /* version 4, IHL 5 (= 20 bytes)   */
+    wr_be16(&ip[2], (uint16_t)(IPV4_MIN_HDR_LEN + payload_len));
     ip[8] = 64;                 /* TTL                             */
     ip[9] = proto;
     wr_be32(&ip[12], src);
@@ -61,7 +64,7 @@ static inline uint16_t build_ipv4(uint8_t *f, uint8_t proto, uint32_t src, uint3
 static inline uint16_t build_udp(uint8_t *f, uint32_t src, uint32_t dst,
                                  uint16_t sport, uint16_t dport)
 {
-    uint8_t *l4 = &f[build_ipv4(f, IP_PROTO_UDP, src, dst)];
+    uint8_t *l4 = &f[build_ipv4(f, IP_PROTO_UDP, src, dst, UDP_HDR_LEN)];
 
     memset(l4, 0, UDP_HDR_LEN);
     wr_be16(&l4[0], sport);
@@ -74,7 +77,7 @@ static inline uint16_t build_udp(uint8_t *f, uint32_t src, uint32_t dst,
 static inline uint16_t build_tcp(uint8_t *f, uint32_t src, uint32_t dst,
                                  uint16_t sport, uint16_t dport)
 {
-    uint8_t *l4 = &f[build_ipv4(f, IP_PROTO_TCP, src, dst)];
+    uint8_t *l4 = &f[build_ipv4(f, IP_PROTO_TCP, src, dst, TCP_MIN_HDR_LEN)];
 
     memset(l4, 0, TCP_MIN_HDR_LEN);
     wr_be16(&l4[0], sport);
