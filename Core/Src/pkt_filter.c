@@ -93,6 +93,51 @@ bool pkt_tcp_flags_valid(uint8_t flags)
     return tcp_valid_flags[flags & TCP_FLAGS_CHECKED];
 }
 
+#define IPV4_ANY            (0x00000000u)   /* 0.0.0.0                     */
+#define IPV4_LOOPBACK_NET   (0x7F000000u)   /* 127.0.0.0/8                 */
+#define IPV4_LOOPBACK_MASK  (0xFF000000u)
+#define IPV4_MULTICAST_MIN  (0xE0000000u)   /* 224.0.0.0: multicast, then
+                                               reserved, then broadcast    */
+#define MAC_GROUP_BIT       (0x01u)         /* I/G bit of the first byte   */
+#define DHCP_CLIENT_PORT    (68u)
+#define DHCP_SERVER_PORT    (67u)
+
+static bool is_dhcp_request(const pkt_hdr_t *hdr)
+{
+    return ((hdr->valid & PKT_HAS_L4) != 0u) && (hdr->ip_proto == IP_PROTO_UDP) &&
+           (hdr->src_port == DHCP_CLIENT_PORT) && (hdr->dst_port == DHCP_SERVER_PORT);
+}
+
+bool pkt_src_is_spoofed(const pkt_hdr_t *hdr)
+{
+    /* Ethernet: the first bit sent says "group address". A source is always
+     * one network card, never a group. Checked for every frame, ARP too. */
+    if ((hdr->src_mac[0] & MAC_GROUP_BIT) != 0u)
+    {
+        return true;
+    }
+
+    if ((hdr->valid & PKT_HAS_IPV4) == 0u)
+    {
+        return false;
+    }
+
+    if ((hdr->src_ip & IPV4_LOOPBACK_MASK) == IPV4_LOOPBACK_NET)
+    {
+        return true;
+    }
+    if (hdr->src_ip >= IPV4_MULTICAST_MIN)
+    {
+        return true;
+    }
+    if (hdr->src_ip == IPV4_ANY)
+    {
+        return !is_dhcp_request(hdr);
+    }
+
+    return hdr->src_ip == hdr->dst_ip;            /* LAND attack */
+}
+
 pkt_action_t pkt_filter_eval(const pkt_rule_t *rules, uint32_t count,
                              pkt_action_t default_action, const pkt_hdr_t *hdr,
                              int32_t *rule_idx)
@@ -139,7 +184,14 @@ static pkt_verdict_t decide(const pkt_filter_t *f, const uint8_t *frame, uint16_
         return v;                                 /* DROP, malformed */
     }
 
-    /* Stage 2: TCP scan detection. */
+    /* Stage 2: anti-spoofing. */
+    if (pkt_src_is_spoofed(hdr))
+    {
+        v.reason = DROP_REASON_SPOOFED;
+        return v;                                 /* DROP, spoofed */
+    }
+
+    /* Stage 3: TCP scan detection. */
     if (((hdr->valid & PKT_HAS_L4) != 0u) && (hdr->ip_proto == IP_PROTO_TCP) &&
         !pkt_tcp_flags_valid(hdr->tcp_flags))
     {
@@ -147,7 +199,7 @@ static pkt_verdict_t decide(const pkt_filter_t *f, const uint8_t *frame, uint16_
         return v;                                 /* DROP, tcp-scan */
     }
 
-    /* Stage 3: the rule table. */
+    /* Stage 4: the rule table. */
     v.action = pkt_filter_eval(f->rules, f->rule_count, f->default_action, hdr, &v.rule_idx);
 
     if (v.action == PKT_PASS)
@@ -196,6 +248,7 @@ const char *pkt_drop_reason_name(pkt_drop_reason_t reason)
     {
         case DROP_REASON_NONE:      return "none";
         case DROP_REASON_MALFORMED: return "malformed";
+        case DROP_REASON_SPOOFED:   return "spoofed";
         case DROP_REASON_TCP_SCAN:  return "tcp-scan";
         case DROP_REASON_RULE:      return "rule";
         case DROP_REASON_DEFAULT:   return "default";

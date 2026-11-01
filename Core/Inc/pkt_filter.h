@@ -67,12 +67,13 @@ typedef struct
     uint8_t      tcp_flags_mask;
 } pkt_rule_t;
 
-/** Why a frame was dropped. Later stages (spoofing, scans, rate limit) add more. */
+/** Why a frame was dropped, in pipeline order. */
 typedef enum
 {
     DROP_REASON_NONE = 0,       /**< Not dropped: the frame passed.               */
     DROP_REASON_MALFORMED,      /**< A header the frame claims to have is broken. */
-    DROP_REASON_TCP_SCAN,       /**< TCP flag combination no real stack sends.    */
+    DROP_REASON_SPOOFED,        /**< Source address that cannot be real.          */
+    DROP_REASON_TCP_SCAN,      /**< TCP flag combination no real stack sends.    */
     DROP_REASON_RULE,           /**< A rule with action DROP matched.             */
     DROP_REASON_DEFAULT,        /**< No rule matched and the default is DROP.     */
     DROP_REASON_COUNT           /**< Number of reasons (array size), not a reason. */
@@ -131,8 +132,8 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
                      pkt_action_t default_action);
 
 /**
- * @brief  Full pipeline for one frame: parse, drop if malformed, else run the
- *         rules. Updates the filter's counters.
+ * @brief  Full pipeline for one frame: sanity (malformed) -> anti-spoofing ->
+ *         TCP scan check -> rule table. Updates the filter's counters.
  * @param  hdr  Filled with the parsed headers (useful for logging).
  */
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
@@ -147,6 +148,22 @@ pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t
  * would need connection tracking to catch.
  */
 bool pkt_tcp_flags_valid(uint8_t flags);
+
+/**
+ * @brief  Does the frame carry a source address no honest sender can have?
+ *
+ * Stateless "martian" checks (RFC 1812, RFC 5735):
+ * - source MAC is multicast/broadcast (a frame always comes from one card);
+ * - source IP is loopback 127.0.0.0/8 (never leaves a machine);
+ * - source IP is multicast, reserved or broadcast (224.0.0.0 and above);
+ * - source IP is 0.0.0.0, except a DHCP request (UDP 68 -> 67), the only
+ *   legal use: a client that has no address yet;
+ * - source IP == destination IP (LAND attack: the target answers itself).
+ *
+ * "Is this source allowed on this link" (ingress filtering, BCP 38) is a
+ * policy, so it is a rule in the table, not a fixed check here.
+ */
+bool pkt_src_is_spoofed(const pkt_hdr_t *hdr);
 
 /** Short name of a drop reason for logs, e.g. "malformed". */
 const char *pkt_drop_reason_name(pkt_drop_reason_t reason);

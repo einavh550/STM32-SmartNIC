@@ -343,6 +343,8 @@ static void test_malformed_never_reaches_rules(void)
 static void test_reason_names(void)
 {
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_MALFORMED), "malformed") == 0);
+    CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_SPOOFED), "spoofed") == 0);
+    CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_TCP_SCAN), "tcp-scan") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_RULE), "rule") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_DEFAULT), "default") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_COUNT), "?") == 0);
@@ -448,6 +450,101 @@ static void test_rule_on_tcp_flags(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Step 4: anti-spoofing                                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Parse a built frame and ask the spoofing check about it. */
+static bool spoofed(uint16_t len)
+{
+    pkt_hdr_t hdr;
+
+    CHECK(parse_all(frame, len, &hdr));
+    return pkt_src_is_spoofed(&hdr);
+}
+
+static void test_real_sources_are_not_spoofed(void)
+{
+    CHECK(!spoofed(build_udp(frame, IP4(192, 168, 7, 2), IP4(192, 168, 7, 1), 5000u, 5000u)));
+    CHECK(!spoofed(build_udp(frame, IP4(169, 254, 236, 228), IP4(169, 254, 255, 255), 137u, 137u)));
+    CHECK(!spoofed(build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 40000u, 80u)));
+    CHECK(!spoofed(build_udp(frame, IP4(223, 255, 255, 255), IP4(10, 0, 0, 1), 1u, 2u))); /* last unicast */
+    CHECK(!spoofed(build_eth(frame, ETHERTYPE_ARP)));
+}
+
+static void test_martian_sources_are_spoofed(void)
+{
+    const uint32_t dst = IP4(192, 168, 7, 1);
+
+    CHECK(spoofed(build_udp(frame, IP4(127, 0, 0, 1), dst, 1u, 2u)));       /* loopback   */
+    CHECK(spoofed(build_udp(frame, IP4(127, 255, 0, 9), dst, 1u, 2u)));
+    CHECK(spoofed(build_udp(frame, IP4(224, 0, 0, 1), dst, 1u, 2u)));       /* multicast  */
+    CHECK(spoofed(build_udp(frame, IP4(240, 0, 0, 1), dst, 1u, 2u)));       /* reserved   */
+    CHECK(spoofed(build_udp(frame, IP4(255, 255, 255, 255), dst, 1u, 2u))); /* broadcast  */
+    CHECK(spoofed(build_tcp(frame, IP4(0, 0, 0, 0), dst, 40000u, 80u)));    /* 0.0.0.0    */
+}
+
+static void test_dhcp_request_may_use_zero_source(void)
+{
+    const uint32_t any = IP4(0, 0, 0, 0), bcast = IP4(255, 255, 255, 255);
+
+    CHECK(!spoofed(build_udp(frame, any, bcast, 68u, 67u)));   /* DHCP Discover   */
+    CHECK(spoofed(build_udp(frame, any, bcast, 67u, 68u)));    /* wrong direction */
+    CHECK(spoofed(build_udp(frame, any, bcast, 68u, 53u)));    /* not DHCP        */
+
+    /* A fragment has no ports, so it cannot prove it is DHCP. */
+    uint16_t len = build_udp(frame, any, bcast, 68u, 67u);
+    wr_be16(&frame[ETH_HDR_LEN + 6u], 0x0001u);                /* frag offset 1   */
+    CHECK(spoofed(len));
+}
+
+static void test_land_attack_is_spoofed(void)
+{
+    const uint32_t victim = IP4(192, 168, 7, 1);
+
+    CHECK(spoofed(build_tcp(frame, victim, victim, 80u, 80u)));
+    CHECK(spoofed(build_udp(frame, victim, victim, 1u, 2u)));
+}
+
+static void test_group_source_mac_is_spoofed(void)
+{
+    uint16_t len = build_eth(frame, ETHERTYPE_ARP);
+
+    frame[6] = 0x01;                                           /* multicast MAC   */
+    CHECK(spoofed(len));
+    memset(&frame[6], 0xFF, ETH_MAC_LEN);                      /* broadcast MAC   */
+    CHECK(spoofed(len));
+    frame[6] = 0x02;                                           /* unicast again   */
+    CHECK(!spoofed(len));
+}
+
+static void test_spoofed_is_dropped_before_rules(void)
+{
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    pkt_verdict_t v;
+    uint16_t      len;
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
+
+    len = build_udp(frame, IP4(127, 0, 0, 1), IP4(192, 168, 7, 1), 1u, 2u);
+    v = pkt_filter_process(&f, frame, len, &hdr);
+    CHECK_EQ(v.action, PKT_DROP);
+    CHECK_EQ(v.reason, DROP_REASON_SPOOFED);
+    CHECK_EQ(v.rule_idx, -1);
+
+    /* Spoofed AND a scan: the earlier stage (spoofing) gets the blame. */
+    len = build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 1), 80u, 80u);
+    set_tcp_flags(frame, 0u);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, &hdr).reason, DROP_REASON_SPOOFED);
+
+    CHECK_EQ(f.dropped[DROP_REASON_SPOOFED], 2u);
+    CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 0u);
+    CHECK_EQ(f.rule_hits[0], 0u);
+    CHECK_EQ(f.passed, 0u);
+}
+
+/* ------------------------------------------------------------------------- */
 
 void run_pkt_filter_tests(void)
 {
@@ -477,4 +574,11 @@ void run_pkt_filter_tests(void)
     RUN_TEST(test_scan_is_dropped_before_rules);
     RUN_TEST(test_udp_is_not_checked_for_flags);
     RUN_TEST(test_rule_on_tcp_flags);
+
+    RUN_TEST(test_real_sources_are_not_spoofed);
+    RUN_TEST(test_martian_sources_are_spoofed);
+    RUN_TEST(test_dhcp_request_may_use_zero_source);
+    RUN_TEST(test_land_attack_is_spoofed);
+    RUN_TEST(test_group_source_mac_is_spoofed);
+    RUN_TEST(test_spoofed_is_dropped_before_rules);
 }

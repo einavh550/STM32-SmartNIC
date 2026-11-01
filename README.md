@@ -91,11 +91,17 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   decides or hands the frame to the next one; the fixed checks run before the
   rule table, so no rule can let a bad frame through:
   1. **sanity**: malformed frames are dropped;
-  2. **TCP scan detection**: the TCP flags must be a combination a real TCP
+  2. **anti-spoofing**: source addresses no honest sender can have
+     ("martians", RFC 1812 / RFC 5735) are dropped: a multicast/broadcast
+     source MAC, a loopback (127/8), multicast, reserved or broadcast source
+     IP, source 0.0.0.0 (allowed only for a DHCP request, UDP 68 -> 67), and
+     source == destination (LAND attack). Which subnets may send on this link
+     (ingress filtering, BCP 38) is policy and belongs in the rule table;
+  3. **TCP scan detection**: the TCP flags must be a combination a real TCP
      stack sends. A 32-entry whitelist (the same idea as Linux
      `nf_conntrack`) drops NULL, FIN, XMAS, SYN+FIN, SYN+RST scans in one
      table lookup. Stateless, so ACK / FIN+ACK scans are not caught;
-  3. **rule table**.
+  4. **rule table**.
 
   It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
 - A frame is malformed when a layer it claims to have is broken (EtherType
@@ -111,10 +117,10 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   port rule cannot hit an ARP frame through stale fields.
 - The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
   statistics: per-rule hits, default hits, passed frames and drops per reason
-  (`malformed`, `tcp-scan`, `rule`, `default`). The main loop prints them
-  every 5 s (example numbers):
+  (`malformed`, `spoofed`, `tcp-scan`, `rule`, `default`). The main loop
+  prints them every 5 s (example numbers):
   ```
-  --- passed 7 | dropped: malformed 0 tcp-scan 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
+  --- passed 7 | dropped: malformed 0 spoofed 0 tcp-scan 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
   ```
 
 **HAL integration**
@@ -145,11 +151,13 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
-- **Host unit tests:** 55 tests (234 checks) build `pkt_parse.c` and
+- **Host unit tests:** 61 tests (285 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,
   Ethernet padding, IPv4 and TCP options, fragments and RFC 1858 fragment
   attacks, real TCP flag combinations vs. NULL / FIN / XMAS scans, TCP flag rules,
+  spoofed sources (loopback, multicast, broadcast, 0.0.0.0 outside DHCP, LAND,
+  group source MAC),
   first-match order, subnet masks, stale-field protection, the demo rule
   table end to end, and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
@@ -165,7 +173,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `234 checks, 0 failed: PASS`.
+Expected last line: `285 checks, 0 failed: PASS`.
 
 ## Build and flash
 

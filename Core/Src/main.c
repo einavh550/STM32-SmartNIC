@@ -392,7 +392,7 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
   }
   else
   {
-    /* malformed, tcp-scan or default */
+    /* malformed, spoofed, tcp-scan or default */
     printf("  => %s (%s)\r\n", verdict, pkt_drop_reason_name(v.reason));
   }
 }
