@@ -19,3 +19,5 @@ $RECYCLE.BIN/
 *.swp
 *.swo
 .DS_Store
+# Host unit test build output
+/tests/build/
