@@ -364,6 +364,11 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
     if ((hdr->valid & PKT_HAS_L4) != 0u)
     {
       printf(" %u->%u", (unsigned)hdr->src_port, (unsigned)hdr->dst_port);
+
+      if (hdr->ip_proto == IP_PROTO_TCP)
+      {
+        printf(" flags 0x%02X", (unsigned)hdr->tcp_flags);
+      }
     }
   }
   else if ((hdr->valid & PKT_HAS_ETH) != 0u)
@@ -381,13 +386,14 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
   {
     printf("  => %s (rule %ld)\r\n", verdict, (long)v.rule_idx);
   }
-  else if (v.reason == DROP_REASON_MALFORMED)
+  else if (v.action == PKT_PASS)
   {
-    printf("  => %s (malformed)\r\n", verdict);
+    printf("  => %s (default)\r\n", verdict);
   }
   else
   {
-    printf("  => %s (default)\r\n", verdict);
+    /* malformed, tcp-scan or default */
+    printf("  => %s (%s)\r\n", verdict, pkt_drop_reason_name(v.reason));
   }
 }
 

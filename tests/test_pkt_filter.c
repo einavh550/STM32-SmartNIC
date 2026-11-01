@@ -349,6 +349,105 @@ static void test_reason_names(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Step 3: TCP scan detection and TCP flag rules                             */
+/* ------------------------------------------------------------------------- */
+
+static void test_tcp_flags_real_traffic_is_valid(void)
+{
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_SYN));                               /* connect   */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_SYN | TCP_FLAG_ACK));                /* accept    */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_ACK));                               /* ack       */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_ACK | TCP_FLAG_PSH));                /* data      */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_FIN | TCP_FLAG_ACK));                /* close     */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_FIN | TCP_FLAG_ACK | TCP_FLAG_PSH)); /* last data */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_RST));                               /* refuse    */
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_RST | TCP_FLAG_ACK));
+    CHECK(pkt_tcp_flags_valid(TCP_FLAG_SYN | TCP_FLAG_ECE | TCP_FLAG_CWR)); /* ECN setup */
+}
+
+static void test_tcp_flags_scans_are_invalid(void)
+{
+    CHECK(!pkt_tcp_flags_valid(0u));                                        /* NULL scan */
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_FIN));                              /* FIN scan  */
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_URG));/* XMAS scan */
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_SYN | TCP_FLAG_FIN));
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_SYN | TCP_FLAG_RST));
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_FIN | TCP_FLAG_RST));
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_PSH));
+    CHECK(!pkt_tcp_flags_valid(TCP_FLAG_URG));
+    CHECK(!pkt_tcp_flags_valid(0xFFu));                                     /* all flags */
+}
+
+static void test_scan_is_dropped_before_rules(void)
+{
+    /* Even a catch-all PASS rule must not let a scan through. */
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    pkt_verdict_t v;
+    uint16_t      len = build_tcp(frame, 1u, 2u, 40000u, 22u);
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
+
+    set_tcp_flags(frame, TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_URG);  /* XMAS */
+    v = pkt_filter_process(&f, frame, len, &hdr);
+    CHECK_EQ(v.action, PKT_DROP);
+    CHECK_EQ(v.reason, DROP_REASON_TCP_SCAN);
+    CHECK_EQ(v.rule_idx, -1);
+
+    set_tcp_flags(frame, 0u);                                          /* NULL */
+    (void)pkt_filter_process(&f, frame, len, &hdr);
+
+    set_tcp_flags(frame, TCP_FLAG_SYN);                                /* real */
+    v = pkt_filter_process(&f, frame, len, &hdr);
+    CHECK_EQ(v.action, PKT_PASS);
+
+    CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 2u);
+    CHECK_EQ(f.rule_hits[0], 1u);                     /* only the real SYN */
+    CHECK_EQ(f.default_hits, 0u);
+    CHECK_EQ(f.passed, 1u);
+}
+
+static void test_udp_is_not_checked_for_flags(void)
+{
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t f;
+    pkt_hdr_t    hdr;
+    uint16_t     len = build_udp(frame, 1u, 2u, 1u, 2u);
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_DROP));
+    CHECK_EQ(pkt_filter_process(&f, frame, len, &hdr).action, PKT_PASS);
+}
+
+static void test_rule_on_tcp_flags(void)
+{
+    /* "New connection attempt": SYN set, ACK clear. */
+    const pkt_rule_t rules[] =
+    {
+        { .match = RULE_TCP_FLAGS, .tcp_flags = TCP_FLAG_SYN,
+          .tcp_flags_mask = TCP_FLAG_SYN | TCP_FLAG_ACK, .action = PKT_DROP },
+    };
+    int32_t  idx;
+    uint16_t len = build_tcp(frame, 1u, 2u, 40000u, 22u);
+
+    set_tcp_flags(frame, TCP_FLAG_SYN);
+    CHECK_EQ(eval(rules, 1u, PKT_PASS, len, &idx), PKT_DROP);
+
+    set_tcp_flags(frame, TCP_FLAG_SYN | TCP_FLAG_ECE | TCP_FLAG_CWR);  /* bits outside the mask */
+    CHECK_EQ(eval(rules, 1u, PKT_PASS, len, &idx), PKT_DROP);
+
+    set_tcp_flags(frame, TCP_FLAG_SYN | TCP_FLAG_ACK);                 /* reply, not a new one */
+    CHECK_EQ(eval(rules, 1u, PKT_PASS, len, &idx), PKT_PASS);
+
+    set_tcp_flags(frame, TCP_FLAG_ACK);
+    CHECK_EQ(eval(rules, 1u, PKT_PASS, len, &idx), PKT_PASS);
+
+    /* UDP has no flags: never matches, even though tcp_flags reads 0. */
+    len = build_udp(frame, 1u, 2u, 1u, 2u);
+    CHECK_EQ(eval(rules, 1u, PKT_PASS, len, &idx), PKT_PASS);
+}
+
+/* ------------------------------------------------------------------------- */
 
 void run_pkt_filter_tests(void)
 {
@@ -372,4 +471,10 @@ void run_pkt_filter_tests(void)
     RUN_TEST(test_process_counters);
     RUN_TEST(test_malformed_never_reaches_rules);
     RUN_TEST(test_reason_names);
+
+    RUN_TEST(test_tcp_flags_real_traffic_is_valid);
+    RUN_TEST(test_tcp_flags_scans_are_invalid);
+    RUN_TEST(test_scan_is_dropped_before_rules);
+    RUN_TEST(test_udp_is_not_checked_for_flags);
+    RUN_TEST(test_rule_on_tcp_flags);
 }

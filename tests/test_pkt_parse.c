@@ -420,6 +420,57 @@ static void test_frame_icmp_and_fragment_are_fine(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Step 3: TCP flags and TCP header length                                   */
+/* ------------------------------------------------------------------------- */
+
+static void test_tcp_flags_are_read(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_tcp(frame, 1u, 2u, 80u, 40000u);
+
+    set_tcp_flags(frame, TCP_FLAG_SYN | TCP_FLAG_ACK);
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+    CHECK_EQ(hdr.tcp_flags, 0x12u);
+
+    len = build_udp(frame, 1u, 2u, 1u, 2u);           /* UDP: flags are 0 */
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+    CHECK_EQ(hdr.tcp_flags, 0u);
+}
+
+static void test_tcp_data_offset_below_5_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_tcp(frame, 1u, 2u, 1u, 2u);
+
+    frame[ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 12u] = 0x40;   /* 4 words = 16 bytes */
+    CHECK(!pkt_parse_frame(frame, len, &hdr));
+}
+
+static void test_tcp_data_offset_past_packet_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_tcp(frame, 1u, 2u, 1u, 2u);
+
+    frame[ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 12u] = 0xF0;   /* claims 60 bytes, has 20 */
+    CHECK(!pkt_parse_frame(frame, len, &hdr));
+}
+
+static void test_tcp_options_are_fine(void)
+{
+    pkt_hdr_t hdr;
+
+    /* TCP header with 4 option bytes (data offset 6 = 24 bytes). */
+    build_tcp(frame, 1u, 2u, 40000u, 22u);
+    wr_be16(&frame[ETH_HDR_LEN + 2], IPV4_MIN_HDR_LEN + 24u);
+    frame[ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 12u] = 0x60;
+    memset(&frame[ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 20u], 0x01, 4);  /* 4 x NOP */
+
+    CHECK(pkt_parse_frame(frame, ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 24u, &hdr));
+    CHECK_EQ(hdr.dst_port, 22u);
+    CHECK_EQ(hdr.tcp_flags, TCP_FLAG_SYN);
+}
+
+/* ------------------------------------------------------------------------- */
 
 void run_pkt_parse_tests(void)
 {
@@ -457,4 +508,9 @@ void run_pkt_parse_tests(void)
     RUN_TEST(test_l4_is_not_read_from_padding);
     RUN_TEST(test_tiny_tcp_first_fragment_is_malformed);
     RUN_TEST(test_tcp_fragment_offset_1_is_malformed);
+
+    RUN_TEST(test_tcp_flags_are_read);
+    RUN_TEST(test_tcp_data_offset_below_5_is_malformed);
+    RUN_TEST(test_tcp_data_offset_past_packet_is_malformed);
+    RUN_TEST(test_tcp_options_are_fine);
 }

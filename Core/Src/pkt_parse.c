@@ -122,9 +122,27 @@ bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
         return false;
     }
 
-    /* TCP and UDP both start with: source port (2 bytes), destination port (2 bytes). */
     const uint8_t *l4 = &frame[out->l4_offset];
 
+    if (out->ip_proto == IP_PROTO_TCP)
+    {
+        /* Byte 12, high 4 bits: TCP header length in 32-bit words (like IHL).
+         * Below 5 is impossible; it must also fit inside the IP packet. */
+        const uint16_t tcp_hdr_len = (uint16_t)((l4[12] >> 4) * 4u);
+
+        if ((tcp_hdr_len < TCP_MIN_HDR_LEN) || (ip_end < out->l4_offset + tcp_hdr_len))
+        {
+            return false;
+        }
+
+        out->tcp_flags = l4[13];       /* byte 13: CWR ECE URG ACK PSH RST SYN FIN */
+    }
+    else
+    {
+        out->tcp_flags = 0u;
+    }
+
+    /* TCP and UDP both start with: source port (2 bytes), destination port (2 bytes). */
     out->src_port = rd_be16(&l4[0]);
     out->dst_port = rd_be16(&l4[2]);
     out->valid   |= PKT_HAS_L4;

@@ -81,12 +81,22 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   small to hold the full TCP header (tiny fragment), and a TCP fragment at
   offset 1 that would overwrite the TCP flags (overlapping fragment).
 - Non-first IP fragments carry no L4 header, so no ports are read from them.
+- TCP: the flags byte is read, and the header length field (data offset) must
+  be at least 20 bytes and fit inside the IP packet.
 - `pkt_hdr_t.valid` records which layers were parsed (`PKT_HAS_ETH/IPV4/L4`).
 - Pure C, no HAL: the same file is compiled for the board and for host tests.
 
 **Rule filter (`pkt_filter.c`)**
-- `pkt_filter_process()` is the whole per-frame pipeline: parse, drop
-  malformed frames before any rule sees them, then run the rule table.
+- `pkt_filter_process()` is the whole per-frame pipeline. Each stage either
+  decides or hands the frame to the next one; the fixed checks run before the
+  rule table, so no rule can let a bad frame through:
+  1. **sanity**: malformed frames are dropped;
+  2. **TCP scan detection**: the TCP flags must be a combination a real TCP
+     stack sends. A 32-entry whitelist (the same idea as Linux
+     `nf_conntrack`) drops NULL, FIN, XMAS, SYN+FIN, SYN+RST scans in one
+     table lookup. Stateless, so ACK / FIN+ACK scans are not caught;
+  3. **rule table**.
+
   It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
 - A frame is malformed when a layer it claims to have is broken (EtherType
   says IPv4 but the header or its length is invalid, protocol says TCP/UDP but
@@ -95,15 +105,16 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 - Ordered rule table, first match wins, default action if nothing matches
   (like a firewall rule list).
 - A rule compares only the fields named in its `match` bits: EtherType,
-  IP protocol, source/destination IP under a mask (subnets), ports.
+  IP protocol, source/destination IP under a mask (subnets), ports, and TCP
+  flags under a mask (e.g. mask `SYN|ACK`, value `SYN` = new connection).
 - A rule that asks about a layer the frame does not have never matches, so a
   port rule cannot hit an ARP frame through stale fields.
 - The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
   statistics: per-rule hits, default hits, passed frames and drops per reason
-  (`malformed`, `rule`, `default`). The main loop prints them every 5 s
-  (example numbers):
+  (`malformed`, `tcp-scan`, `rule`, `default`). The main loop prints them
+  every 5 s (example numbers):
   ```
-  --- passed 7 | dropped: malformed 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
+  --- passed 7 | dropped: malformed 0 tcp-scan 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
   ```
 
 **HAL integration**
@@ -134,10 +145,11 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
-- **Host unit tests:** 46 tests (186 checks) build `pkt_parse.c` and
+- **Host unit tests:** 55 tests (234 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,
-  Ethernet padding, IPv4 options, fragments and RFC 1858 fragment attacks,
+  Ethernet padding, IPv4 and TCP options, fragments and RFC 1858 fragment
+  attacks, real TCP flag combinations vs. NULL / FIN / XMAS scans, TCP flag rules,
   first-match order, subnet masks, stale-field protection, the demo rule
   table end to end, and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
@@ -153,7 +165,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `186 checks, 0 failed: PASS`.
+Expected last line: `234 checks, 0 failed: PASS`.
 
 ## Build and flash
 

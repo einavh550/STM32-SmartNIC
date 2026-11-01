@@ -87,6 +87,12 @@ static inline uint16_t build_tcp(uint8_t *f, uint32_t src, uint32_t dst,
     return ETH_HDR_LEN + IPV4_MIN_HDR_LEN + TCP_MIN_HDR_LEN;
 }
 
+/** Change the TCP flags of a frame made by build_tcp(). */
+static inline void set_tcp_flags(uint8_t *f, uint8_t flags)
+{
+    f[ETH_HDR_LEN + IPV4_MIN_HDR_LEN + 13u] = flags;
+}
+
 /** Parse every layer that is present, without judging if the frame is
  *  malformed (that is pkt_parse_frame()'s job). Lets tests look at what each
  *  single parser step did. */

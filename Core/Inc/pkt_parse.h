@@ -32,6 +32,16 @@
 #define UDP_HDR_LEN         (8u)
 #define TCP_MIN_HDR_LEN     (20u)   /**< TCP header without options.             */
 
+/* TCP flag bits (byte 13 of the TCP header). */
+#define TCP_FLAG_FIN        (0x01u) /**< Sender is done sending.                 */
+#define TCP_FLAG_SYN        (0x02u) /**< Open a connection.                      */
+#define TCP_FLAG_RST        (0x04u) /**< Abort the connection.                   */
+#define TCP_FLAG_PSH        (0x08u) /**< Deliver data now.                       */
+#define TCP_FLAG_ACK        (0x10u) /**< Acknowledges received data.             */
+#define TCP_FLAG_URG        (0x20u) /**< Urgent pointer is valid.                */
+#define TCP_FLAG_ECE        (0x40u) /**< ECN echo (congestion signal).           */
+#define TCP_FLAG_CWR        (0x80u) /**< Congestion window reduced.              */
+
 /* Bits of pkt_hdr_t.valid: which layers were parsed successfully. */
 #define PKT_HAS_ETH         (1u << 0)
 #define PKT_HAS_IPV4        (1u << 1)
@@ -63,9 +73,10 @@ typedef struct
                                 can be longer (Ethernet padding), never shorter. */
     uint16_t ip_frag_off;  /**< Fragment offset in 8-byte units, 0 = first piece. */
 
-    /* TCP/UDP, valid only after pkt_parse_l4() returned true. */
+    /* TCP/UDP, valid only after pkt_parse_l4() returned true (PKT_HAS_L4). */
     uint16_t src_port;
     uint16_t dst_port;
+    uint8_t  tcp_flags;    /**< TCP_FLAG_* bits; 0 for UDP.                     */
 } pkt_hdr_t;
 
 /* ------------------------------------------------------------------------- */
@@ -91,10 +102,11 @@ bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 
 /**
- * @brief  Read the source and destination ports of a TCP or UDP header.
+ * @brief  Read the ports of a TCP or UDP header, and the flags of a TCP header.
  * @note   Call only after pkt_parse_ipv4() succeeded.
  * @return true on success, false if the protocol is not TCP/UDP, the packet is
- *         a non-first fragment (no L4 header in it), or the header is truncated.
+ *         a non-first fragment (no L4 header in it), the header is truncated,
+ *         or the TCP header length field is below 20 or past the packet end.
  */
 bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 

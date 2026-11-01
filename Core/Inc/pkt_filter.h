@@ -25,6 +25,7 @@
 #define RULE_DST_IP         (1u << 3)
 #define RULE_SRC_PORT       (1u << 4)
 #define RULE_DST_PORT       (1u << 5)
+#define RULE_TCP_FLAGS      (1u << 6)   /**< TCP only: (flags & mask) == value. */
 
 /** Most rules one filter can hold (size of the per-rule hit counter array). */
 #define PKT_FILTER_MAX_RULES    (16u)
@@ -45,6 +46,10 @@ typedef enum
  * IP addresses are compared under a mask, so one rule can cover a subnet:
  * src_ip = 192.168.7.0 with src_mask = 255.255.255.0 matches 192.168.7.x.
  * Use mask 0xFFFFFFFF for a single address.
+ *
+ * TCP flags are compared the same way: tcp_flags_mask picks the bits to look
+ * at, tcp_flags says what they must be. "New connection attempt" is
+ * mask = SYN|ACK, value = SYN (SYN set, ACK clear).
  */
 typedef struct
 {
@@ -58,6 +63,8 @@ typedef struct
     uint16_t     src_port;
     uint16_t     dst_port;
     uint8_t      ip_proto;
+    uint8_t      tcp_flags;
+    uint8_t      tcp_flags_mask;
 } pkt_rule_t;
 
 /** Why a frame was dropped. Later stages (spoofing, scans, rate limit) add more. */
@@ -65,6 +72,7 @@ typedef enum
 {
     DROP_REASON_NONE = 0,       /**< Not dropped: the frame passed.               */
     DROP_REASON_MALFORMED,      /**< A header the frame claims to have is broken. */
+    DROP_REASON_TCP_SCAN,       /**< TCP flag combination no real stack sends.    */
     DROP_REASON_RULE,           /**< A rule with action DROP matched.             */
     DROP_REASON_DEFAULT,        /**< No rule matched and the default is DROP.     */
     DROP_REASON_COUNT           /**< Number of reasons (array size), not a reason. */
@@ -129,6 +137,16 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
  */
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
                                  pkt_hdr_t *hdr);
+
+/**
+ * @brief  Is this TCP flag combination one a real TCP stack can send?
+ *
+ * NULL scans (no flags), FIN scans (FIN alone), XMAS scans (FIN+PSH+URG),
+ * SYN+FIN, SYN+RST and friends return false. PSH, ECE and CWR do not change
+ * the answer. Stateless: an ACK or FIN+ACK scan looks like normal traffic and
+ * would need connection tracking to catch.
+ */
+bool pkt_tcp_flags_valid(uint8_t flags);
 
 /** Short name of a drop reason for logs, e.g. "malformed". */
 const char *pkt_drop_reason_name(pkt_drop_reason_t reason);
