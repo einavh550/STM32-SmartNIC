@@ -202,19 +202,28 @@ static void test_demo_rule_table(void)
     const pkt_rule_t rules[] =
     {
         { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 137u,
-          .action = PKT_DROP },
+          .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
         { .match = RULE_ETHERTYPE, .ethertype = ETHERTYPE_ARP, .action = PKT_PASS },
         { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 67u,
           .action = PKT_PASS },
     };
     const uint32_t n = sizeof(rules) / sizeof(rules[0]);
-    int32_t  idx;
-    uint16_t len;
+    int32_t      idx;
+    uint16_t     len;
+    pkt_filter_t f;
+    pkt_hdr_t    hdr;
 
-    /* NetBIOS broadcast from the laptop -> r0 DROP */
+    /* NetBIOS broadcast from the laptop -> r0 RATE_LIMIT. A Windows group of
+     * 3 at once: 1 passes, 2 are rate-limited; a second later 1 passes again. */
     len = build_udp(frame, IP4(169, 254, 236, 228), IP4(169, 254, 255, 255), 137u, 137u);
-    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_DROP);
+    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_RATE_LIMIT);
     CHECK_EQ(idx, 0);
+
+    CHECK(pkt_filter_init(&f, rules, n, PKT_DROP));
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 5000u, &hdr).action, PKT_PASS);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 5001u, &hdr).reason, DROP_REASON_RATE_LIMIT);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 5002u, &hdr).reason, DROP_REASON_RATE_LIMIT);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 6002u, &hdr).action, PKT_PASS);
 
     /* ARP -> r1 PASS */
     len = build_eth(frame, ETHERTYPE_ARP);
@@ -265,28 +274,28 @@ static void test_process_verdicts(void)
 
     /* PASS by a rule: reason NONE. */
     len = build_eth(frame, ETHERTYPE_ARP);
-    v   = pkt_filter_process(&f, frame, len, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
     CHECK_EQ(v.reason, DROP_REASON_NONE);
     CHECK_EQ(v.rule_idx, 1);
 
     /* DROP by a rule. */
     len = build_udp(frame, 1u, 2u, 137u, 137u);
-    v   = pkt_filter_process(&f, frame, len, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_RULE);
     CHECK_EQ(v.rule_idx, 0);
 
     /* DROP by the default. */
     len = build_tcp(frame, 1u, 2u, 40000u, 80u);
-    v   = pkt_filter_process(&f, frame, len, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_DEFAULT);
     CHECK_EQ(v.rule_idx, -1);
 
     /* DROP as malformed: UDP to port 67 would PASS, but the header is cut. */
     len = build_udp(frame, 1u, 2u, 68u, 67u);
-    v   = pkt_filter_process(&f, frame, len - 1u, &hdr);
+    v   = pkt_filter_process(&f, frame, len - 1u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_MALFORMED);
     CHECK_EQ(v.rule_idx, -1);
@@ -301,15 +310,15 @@ static void test_process_counters(void)
     CHECK(pkt_filter_init(&f, demo_rules, 3u, PKT_DROP));
 
     len = build_udp(frame, 1u, 2u, 137u, 137u);       /* r0 DROP   */
-    (void)pkt_filter_process(&f, frame, len, &hdr);
-    (void)pkt_filter_process(&f, frame, len, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
     len = build_eth(frame, ETHERTYPE_ARP);            /* r1 PASS   */
-    (void)pkt_filter_process(&f, frame, len, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
     len = build_udp(frame, 0u, 0xFFFFFFFFu, 68u, 67u);/* r2 PASS   */
-    (void)pkt_filter_process(&f, frame, len, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
     len = build_tcp(frame, 1u, 2u, 40000u, 80u);      /* default   */
-    (void)pkt_filter_process(&f, frame, len, &hdr);
-    (void)pkt_filter_process(&f, frame, 10u, &hdr);   /* malformed */
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, 10u, 0u, &hdr);   /* malformed */
 
     CHECK_EQ(f.passed, 2u);
     CHECK_EQ(f.dropped[DROP_REASON_RULE], 2u);
@@ -334,7 +343,7 @@ static void test_malformed_never_reaches_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
     frame[ETH_HDR_LEN] = 0x44;                        /* IHL 4: impossible */
 
-    v = pkt_filter_process(&f, frame, len, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_MALFORMED);
     CHECK_EQ(f.rule_hits[0], 0u);
@@ -345,6 +354,7 @@ static void test_reason_names(void)
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_MALFORMED), "malformed") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_SPOOFED), "spoofed") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_TCP_SCAN), "tcp-scan") == 0);
+    CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_RATE_LIMIT), "rate-limit") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_RULE), "rule") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_DEFAULT), "default") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_COUNT), "?") == 0);
@@ -392,16 +402,16 @@ static void test_scan_is_dropped_before_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
 
     set_tcp_flags(frame, TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_URG);  /* XMAS */
-    v = pkt_filter_process(&f, frame, len, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_TCP_SCAN);
     CHECK_EQ(v.rule_idx, -1);
 
     set_tcp_flags(frame, 0u);                                          /* NULL */
-    (void)pkt_filter_process(&f, frame, len, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
 
     set_tcp_flags(frame, TCP_FLAG_SYN);                                /* real */
-    v = pkt_filter_process(&f, frame, len, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
 
     CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 2u);
@@ -418,7 +428,7 @@ static void test_udp_is_not_checked_for_flags(void)
     uint16_t     len = build_udp(frame, 1u, 2u, 1u, 2u);
 
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_DROP));
-    CHECK_EQ(pkt_filter_process(&f, frame, len, &hdr).action, PKT_PASS);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);
 }
 
 static void test_rule_on_tcp_flags(void)
@@ -528,7 +538,7 @@ static void test_spoofed_is_dropped_before_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
 
     len = build_udp(frame, IP4(127, 0, 0, 1), IP4(192, 168, 7, 1), 1u, 2u);
-    v = pkt_filter_process(&f, frame, len, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_SPOOFED);
     CHECK_EQ(v.rule_idx, -1);
@@ -536,12 +546,142 @@ static void test_spoofed_is_dropped_before_rules(void)
     /* Spoofed AND a scan: the earlier stage (spoofing) gets the blame. */
     len = build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 1), 80u, 80u);
     set_tcp_flags(frame, 0u);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, &hdr).reason, DROP_REASON_SPOOFED);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).reason, DROP_REASON_SPOOFED);
 
     CHECK_EQ(f.dropped[DROP_REASON_SPOOFED], 2u);
     CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 0u);
     CHECK_EQ(f.rule_hits[0], 0u);
     CHECK_EQ(f.passed, 0u);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Step 5: token bucket rate limiting                                        */
+/* ------------------------------------------------------------------------- */
+
+static void test_bucket_starts_full_then_empties(void)
+{
+    pkt_bucket_t b = { 0 };
+
+    /* burst 3: three frames at the same moment pass, the fourth does not. */
+    CHECK(pkt_bucket_take(&b, 10u, 3u, 1000u));
+    CHECK(pkt_bucket_take(&b, 10u, 3u, 1000u));
+    CHECK(pkt_bucket_take(&b, 10u, 3u, 1000u));
+    CHECK(!pkt_bucket_take(&b, 10u, 3u, 1000u));
+}
+
+static void test_bucket_refills_at_rate(void)
+{
+    pkt_bucket_t b = { 0 };
+
+    CHECK(pkt_bucket_take(&b, 10u, 1u, 0u));        /* 10/s = 1 token per 100 ms */
+    CHECK(!pkt_bucket_take(&b, 10u, 1u, 99u));      /* 0.99 token: not yet       */
+    CHECK(pkt_bucket_take(&b, 10u, 1u, 100u));      /* 99 ms + 1 ms add up       */
+    CHECK(!pkt_bucket_take(&b, 10u, 1u, 150u));
+    CHECK(pkt_bucket_take(&b, 10u, 1u, 200u));
+}
+
+static void test_bucket_never_exceeds_burst(void)
+{
+    pkt_bucket_t b = { 0 };
+
+    CHECK(pkt_bucket_take(&b, 100u, 2u, 0u));
+    /* An hour of silence earns 2 tokens (the burst), not 360000. */
+    CHECK(pkt_bucket_take(&b, 100u, 2u, 3600000u));
+    CHECK(pkt_bucket_take(&b, 100u, 2u, 3600000u));
+    CHECK(!pkt_bucket_take(&b, 100u, 2u, 3600000u));
+}
+
+static void test_bucket_survives_tick_wrap(void)
+{
+    pkt_bucket_t b = { 0 };
+
+    /* HAL_GetTick() wraps to 0 after ~49.7 days. */
+    CHECK(pkt_bucket_take(&b, 10u, 1u, 0xFFFFFFC0u));        /* 64 ms before the wrap */
+    CHECK(!pkt_bucket_take(&b, 10u, 1u, 0xFFFFFFF0u));
+    CHECK(pkt_bucket_take(&b, 10u, 1u, 36u));                /* 100 ms later, wrapped */
+}
+
+static void test_bucket_no_overflow(void)
+{
+    pkt_bucket_t b = { 0 };
+
+    /* Largest rate and burst, longest gap: the math must not wrap around. */
+    CHECK(pkt_bucket_take(&b, 0xFFFFu, 0xFFFFu, 0u));
+    CHECK(pkt_bucket_take(&b, 0xFFFFu, 0xFFFFu, 0xFFFFFFFFu));
+    CHECK_EQ(b.tokens_milli, (uint32_t)0xFFFFu * 1000u - 1000u);
+}
+
+static void test_init_rejects_bad_rate_limit(void)
+{
+    const pkt_rule_t no_rate[]  = { { .action = PKT_RATE_LIMIT, .rate_pps = 0u, .burst = 5u } };
+    const pkt_rule_t no_burst[] = { { .action = PKT_RATE_LIMIT, .rate_pps = 5u, .burst = 0u } };
+    const pkt_rule_t ok[]       = { { .action = PKT_RATE_LIMIT, .rate_pps = 5u, .burst = 5u } };
+    pkt_filter_t f;
+
+    CHECK(!pkt_filter_init(&f, no_rate, 1u, PKT_DROP));
+    CHECK(!pkt_filter_init(&f, no_burst, 1u, PKT_DROP));
+    CHECK(pkt_filter_init(&f, ok, 1u, PKT_DROP));
+}
+
+static void test_syn_flood_is_rate_limited(void)
+{
+    /* Limit new TCP connections to 10/s, burst 3. Other traffic is free. */
+    const pkt_rule_t rules[] =
+    {
+        { .match = RULE_TCP_FLAGS, .tcp_flags = TCP_FLAG_SYN,
+          .tcp_flags_mask = TCP_FLAG_SYN | TCP_FLAG_ACK,
+          .action = PKT_RATE_LIMIT, .rate_pps = 10u, .burst = 3u },
+        { .match = 0u, .action = PKT_PASS },
+    };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    pkt_verdict_t v;
+    uint16_t      len = build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 40000u, 80u);
+
+    CHECK(pkt_filter_init(&f, rules, 2u, PKT_DROP));
+
+    /* Flood: 10 SYNs in the same millisecond. */
+    for (uint32_t i = 0u; i < 10u; i++)
+    {
+        v = pkt_filter_process(&f, frame, len, 1000u, &hdr);
+        CHECK_EQ(v.rule_idx, 0);
+    }
+    CHECK_EQ(f.passed, 3u);                                  /* the burst      */
+    CHECK_EQ(f.dropped[DROP_REASON_RATE_LIMIT], 7u);
+    CHECK_EQ(f.rule_hits[0], 10u);                           /* all matched r0 */
+
+    /* Data packets (ACK) of open connections are not slowed down. */
+    set_tcp_flags(frame, TCP_FLAG_ACK);
+    v = pkt_filter_process(&f, frame, len, 1000u, &hdr);
+    CHECK_EQ(v.action, PKT_PASS);
+    CHECK_EQ(v.rule_idx, 1);
+
+    /* 100 ms later one new connection may start again. */
+    set_tcp_flags(frame, TCP_FLAG_SYN);
+    v = pkt_filter_process(&f, frame, len, 1100u, &hdr);
+    CHECK_EQ(v.action, PKT_PASS);
+    CHECK_EQ(v.reason, DROP_REASON_NONE);
+}
+
+static void test_each_rule_has_its_own_bucket(void)
+{
+    const pkt_rule_t rules[] =
+    {
+        { .match = RULE_DST_PORT, .dst_port = 1000u, .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
+        { .match = RULE_DST_PORT, .dst_port = 2000u, .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
+    };
+    pkt_filter_t f;
+    pkt_hdr_t    hdr;
+    uint16_t     len;
+
+    CHECK(pkt_filter_init(&f, rules, 2u, PKT_DROP));
+
+    len = build_udp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 5u, 1000u);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_DROP);   /* r0 empty */
+
+    len = build_udp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 5u, 2000u);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);   /* r1 full  */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -581,4 +721,13 @@ void run_pkt_filter_tests(void)
     RUN_TEST(test_land_attack_is_spoofed);
     RUN_TEST(test_group_source_mac_is_spoofed);
     RUN_TEST(test_spoofed_is_dropped_before_rules);
+
+    RUN_TEST(test_bucket_starts_full_then_empties);
+    RUN_TEST(test_bucket_refills_at_rate);
+    RUN_TEST(test_bucket_never_exceeds_burst);
+    RUN_TEST(test_bucket_survives_tick_wrap);
+    RUN_TEST(test_bucket_no_overflow);
+    RUN_TEST(test_init_rejects_bad_rate_limit);
+    RUN_TEST(test_syn_flood_is_rate_limited);
+    RUN_TEST(test_each_rule_has_its_own_bucket);
 }

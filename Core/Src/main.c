@@ -72,9 +72,11 @@ ETH_HandleTypeDef heth;
  * Chosen to match the traffic a Windows PC sends on a direct cable. */
 static const pkt_rule_t filter_rules[] =
 {
-  /* 0: drop Windows NetBIOS name broadcasts */
+  /* 0: Windows NetBIOS name broadcasts: at most 1 per second, no burst.
+   *    Windows sends them in quick groups of 3, so most of each group is
+   *    rate-limited: a live demo of the token bucket. */
   { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 137u,
-    .action = PKT_DROP },
+    .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
   /* 1: pass ARP */
   { .match = RULE_ETHERTYPE, .ethertype = ETHERTYPE_ARP,
     .action = PKT_PASS },
@@ -208,7 +210,7 @@ int main(void)
     while (eth_rx_pop(&pkt))
     {
       /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
-      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, &hdr);
+      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, HAL_GetTick(), &hdr);
 
       log_frame(pkt.len, &hdr, v);
 
@@ -384,7 +386,9 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
 
   if (v.rule_idx >= 0)
   {
-    printf("  => %s (rule %ld)\r\n", verdict, (long)v.rule_idx);
+    /* A rate-limit drop also has a rule: say which rule and why. */
+    printf("  => %s (rule %ld%s)\r\n", verdict, (long)v.rule_idx,
+           (v.reason == DROP_REASON_RATE_LIMIT) ? ", rate-limit" : "");
   }
   else if (v.action == PKT_PASS)
   {

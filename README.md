@@ -101,7 +101,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
      stack sends. A 32-entry whitelist (the same idea as Linux
      `nf_conntrack`) drops NULL, FIN, XMAS, SYN+FIN, SYN+RST scans in one
      table lookup. Stateless, so ACK / FIN+ACK scans are not caught;
-  4. **rule table**.
+  4. **rule table**, with actions PASS, DROP and RATE_LIMIT.
 
   It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
 - A frame is malformed when a layer it claims to have is broken (EtherType
@@ -115,12 +115,27 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   flags under a mask (e.g. mask `SYN|ACK`, value `SYN` = new connection).
 - A rule that asks about a layer the frame does not have never matches, so a
   port rule cannot hit an ARP frame through stale fields.
+- **Rate limiting (flood protection):** a `PKT_RATE_LIMIT` rule passes
+  matching frames through a token bucket: `rate_pps` tokens per second, at
+  most `burst` stored, one token per frame, the rest is dropped as
+  `rate-limit`. Example: a rule on TCP flags `SYN` without `ACK` with
+  10/s, burst 3 limits new connections (SYN flood) while data packets of open
+  connections are not slowed down.
+  - Tokens are kept in thousandths, so the refill `elapsed_ms * rate_pps` is
+    exact integer math (no float, no rounding loss); 64-bit for the product,
+    so even a gap of days cannot overflow.
+  - Time comes from the caller (`HAL_GetTick()` on the board, a fake clock in
+    the tests), which keeps the filter free of HAL. Tick wrap-around after
+    49.7 days is handled by unsigned subtraction.
+  - Each rule has its own bucket in `pkt_filter_t`; the rule table stays `const`.
+  - The demo table rate-limits Windows NetBIOS broadcasts to 1/s (they arrive
+    in groups of 3), so the limiter can be watched live on the COM port.
 - The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
   statistics: per-rule hits, default hits, passed frames and drops per reason
-  (`malformed`, `spoofed`, `tcp-scan`, `rule`, `default`). The main loop
-  prints them every 5 s (example numbers):
+  (`malformed`, `spoofed`, `tcp-scan`, `rate-limit`, `rule`, `default`). The
+  main loop prints them every 5 s (example numbers):
   ```
-  --- passed 7 | dropped: malformed 0 spoofed 0 tcp-scan 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
+  --- passed 11 | dropped: malformed 0 spoofed 0 tcp-scan 0 rate-limit 8 rule 0 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
   ```
 
 **HAL integration**
@@ -151,13 +166,14 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
-- **Host unit tests:** 61 tests (285 checks) build `pkt_parse.c` and
+- **Host unit tests:** 69 tests (335 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,
   Ethernet padding, IPv4 and TCP options, fragments and RFC 1858 fragment
   attacks, real TCP flag combinations vs. NULL / FIN / XMAS scans, TCP flag rules,
   spoofed sources (loopback, multicast, broadcast, 0.0.0.0 outside DHCP, LAND,
-  group source MAC),
+  group source MAC), the token bucket (burst, refill, cap, tick wrap,
+  overflow, SYN flood),
   first-match order, subnet masks, stale-field protection, the demo rule
   table end to end, and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
@@ -173,7 +189,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `285 checks, 0 failed: PASS`.
+Expected last line: `335 checks, 0 failed: PASS`.
 
 ## Build and flash
 

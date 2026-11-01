@@ -138,6 +138,37 @@ bool pkt_src_is_spoofed(const pkt_hdr_t *hdr)
     return hdr->src_ip == hdr->dst_ip;            /* LAND attack */
 }
 
+#define MILLI_PER_TOKEN     (1000u)
+
+bool pkt_bucket_take(pkt_bucket_t *b, uint16_t rate_pps, uint16_t burst, uint32_t now_ms)
+{
+    const uint32_t full = (uint32_t)burst * MILLI_PER_TOKEN;
+
+    if (!b->started)
+    {
+        b->started      = true;
+        b->tokens_milli = full;                   /* a new bucket starts full */
+    }
+    else
+    {
+        /* ms * (frames / s) = thousandths of a frame: exact, no division.
+         * Unsigned subtraction stays correct when now_ms wraps at 2^32, and
+         * 64-bit math cannot overflow even after days of silence. */
+        const uint32_t elapsed = now_ms - b->last_ms;
+        const uint64_t tokens  = (uint64_t)b->tokens_milli + ((uint64_t)elapsed * rate_pps);
+
+        b->tokens_milli = (tokens > full) ? full : (uint32_t)tokens;
+    }
+    b->last_ms = now_ms;
+
+    if (b->tokens_milli < MILLI_PER_TOKEN)
+    {
+        return false;                             /* empty: over the rate     */
+    }
+    b->tokens_milli -= MILLI_PER_TOKEN;
+    return true;
+}
+
 pkt_action_t pkt_filter_eval(const pkt_rule_t *rules, uint32_t count,
                              pkt_action_t default_action, const pkt_hdr_t *hdr,
                              int32_t *rule_idx)
@@ -162,8 +193,15 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
     {
         return false;
     }
+    for (uint32_t i = 0u; i < count; i++)
+    {
+        if ((rules[i].action == PKT_RATE_LIMIT) && ((rules[i].rate_pps == 0u) || (rules[i].burst == 0u)))
+        {
+            return false;             /* a bucket that never holds a token */
+        }
+    }
 
-    memset(f, 0, sizeof(*f));         /* all counters start at 0 */
+    memset(f, 0, sizeof(*f));         /* counters 0, buckets not started */
     f->rules          = rules;
     f->rule_count     = count;
     f->default_action = default_action;
@@ -173,8 +211,8 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
 
 /* The pipeline: each stage either decides (return) or hands over to the next.
  * Cheap, always-on checks come first, so no rule can let a bad frame through. */
-static pkt_verdict_t decide(const pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                            pkt_hdr_t *hdr)
+static pkt_verdict_t decide(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
+                            uint32_t now_ms, pkt_hdr_t *hdr)
 {
     pkt_verdict_t v = { .action = PKT_DROP, .reason = DROP_REASON_MALFORMED, .rule_idx = -1 };
 
@@ -202,6 +240,19 @@ static pkt_verdict_t decide(const pkt_filter_t *f, const uint8_t *frame, uint16_
     /* Stage 4: the rule table. */
     v.action = pkt_filter_eval(f->rules, f->rule_count, f->default_action, hdr, &v.rule_idx);
 
+    if (v.action == PKT_RATE_LIMIT)               /* only a rule can say this */
+    {
+        const pkt_rule_t *r = &f->rules[v.rule_idx];
+
+        if (!pkt_bucket_take(&f->buckets[v.rule_idx], r->rate_pps, r->burst, now_ms))
+        {
+            v.action = PKT_DROP;
+            v.reason = DROP_REASON_RATE_LIMIT;
+            return v;                             /* DROP, rate-limit */
+        }
+        v.action = PKT_PASS;
+    }
+
     if (v.action == PKT_PASS)
     {
         v.reason = DROP_REASON_NONE;
@@ -215,9 +266,9 @@ static pkt_verdict_t decide(const pkt_filter_t *f, const uint8_t *frame, uint16_
 }
 
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                                 pkt_hdr_t *hdr)
+                                 uint32_t now_ms, pkt_hdr_t *hdr)
 {
-    const pkt_verdict_t v = decide(f, frame, len, hdr);
+    const pkt_verdict_t v = decide(f, frame, len, now_ms, hdr);
 
     /* Rule statistics: only frames that reached the rule table. */
     if (v.rule_idx >= 0)
@@ -250,6 +301,7 @@ const char *pkt_drop_reason_name(pkt_drop_reason_t reason)
         case DROP_REASON_MALFORMED: return "malformed";
         case DROP_REASON_SPOOFED:   return "spoofed";
         case DROP_REASON_TCP_SCAN:  return "tcp-scan";
+        case DROP_REASON_RATE_LIMIT: return "rate-limit";
         case DROP_REASON_RULE:      return "rule";
         case DROP_REASON_DEFAULT:   return "default";
         default:                    return "?";

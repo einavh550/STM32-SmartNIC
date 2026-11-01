@@ -10,6 +10,7 @@
 #ifndef INC_PKT_FILTER_H_
 #define INC_PKT_FILTER_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "pkt_parse.h"
 
@@ -37,7 +38,9 @@
 typedef enum
 {
     PKT_PASS = 0,
-    PKT_DROP
+    PKT_DROP,
+    PKT_RATE_LIMIT  /**< Rule action only: pass while the rule's token bucket
+                         has a token, else drop. A verdict is PASS or DROP. */
 } pkt_action_t;
 
 /**
@@ -50,6 +53,10 @@ typedef enum
  * TCP flags are compared the same way: tcp_flags_mask picks the bits to look
  * at, tcp_flags says what they must be. "New connection attempt" is
  * mask = SYN|ACK, value = SYN (SYN set, ACK clear).
+ *
+ * With action PKT_RATE_LIMIT, matching frames pass at most rate_pps per
+ * second on average, with bursts of up to `burst` frames (token bucket).
+ * Both must be > 0.
  */
 typedef struct
 {
@@ -65,7 +72,22 @@ typedef struct
     uint8_t      ip_proto;
     uint8_t      tcp_flags;
     uint8_t      tcp_flags_mask;
+    uint16_t     rate_pps;   /**< PKT_RATE_LIMIT: tokens added per second. */
+    uint16_t     burst;      /**< PKT_RATE_LIMIT: bucket size in frames.   */
 } pkt_rule_t;
+
+/**
+ * @brief Token bucket state of one rate-limited rule.
+ *
+ * Tokens are stored in thousandths (1 frame = 1000), so a refill of
+ * elapsed_ms * rate_pps is exact integer math: no float, no rounding loss.
+ */
+typedef struct
+{
+    uint32_t tokens_milli;  /**< Current tokens x 1000.                      */
+    uint32_t last_ms;       /**< Time of the last refill.                    */
+    bool     started;       /**< false until the first frame (bucket full). */
+} pkt_bucket_t;
 
 /** Why a frame was dropped, in pipeline order. */
 typedef enum
@@ -74,6 +96,7 @@ typedef enum
     DROP_REASON_MALFORMED,      /**< A header the frame claims to have is broken. */
     DROP_REASON_SPOOFED,        /**< Source address that cannot be real.          */
     DROP_REASON_TCP_SCAN,      /**< TCP flag combination no real stack sends.    */
+    DROP_REASON_RATE_LIMIT,     /**< A PKT_RATE_LIMIT rule's bucket was empty.    */
     DROP_REASON_RULE,           /**< A rule with action DROP matched.             */
     DROP_REASON_DEFAULT,        /**< No rule matched and the default is DROP.     */
     DROP_REASON_COUNT           /**< Number of reasons (array size), not a reason. */
@@ -103,6 +126,8 @@ typedef struct
     uint32_t default_hits;                    /**< Well-formed frames no rule matched. */
     uint32_t passed;                          /**< Frames with action PASS.            */
     uint32_t dropped[DROP_REASON_COUNT];      /**< Drops per reason ([NONE] stays 0).  */
+
+    pkt_bucket_t buckets[PKT_FILTER_MAX_RULES]; /**< One per rule (used by RATE_LIMIT). */
 } pkt_filter_t;
 
 /* ------------------------------------------------------------------------- */
@@ -126,7 +151,8 @@ pkt_action_t pkt_filter_eval(const pkt_rule_t *rules, uint32_t count,
 
 /**
  * @brief  Set up a filter and zero its counters.
- * @return false if count is larger than PKT_FILTER_MAX_RULES.
+ * @return false if count is larger than PKT_FILTER_MAX_RULES, or a
+ *         PKT_RATE_LIMIT rule has rate_pps or burst 0.
  */
 bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
                      pkt_action_t default_action);
@@ -134,10 +160,23 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
 /**
  * @brief  Full pipeline for one frame: sanity (malformed) -> anti-spoofing ->
  *         TCP scan check -> rule table. Updates the filter's counters.
- * @param  hdr  Filled with the parsed headers (useful for logging).
+ * @param  now_ms  Current time in ms (HAL_GetTick() on the board), for the
+ *                 rate limiter. Wrap-around at 2^32 is handled.
+ * @param  hdr     Filled with the parsed headers (useful for logging).
  */
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                                 pkt_hdr_t *hdr);
+                                 uint32_t now_ms, pkt_hdr_t *hdr);
+
+/**
+ * @brief  Token bucket: refill for the time since the last call, then try to
+ *         take one token.
+ *
+ * A new bucket starts full (burst tokens), so a quiet source can send a short
+ * burst at once; after that it gets rate_pps tokens per second, never more
+ * than burst.
+ * @return true if a token was taken (frame may pass).
+ */
+bool pkt_bucket_take(pkt_bucket_t *b, uint16_t rate_pps, uint16_t burst, uint32_t now_ms);
 
 /**
  * @brief  Is this TCP flag combination one a real TCP stack can send?
