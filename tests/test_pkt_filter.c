@@ -193,55 +193,6 @@ static void test_port_rule_ignores_fragment(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* The demo rule table from main.c, end to end                               */
-/* ------------------------------------------------------------------------- */
-
-static void test_demo_rule_table(void)
-{
-    /* Same table as filter_rules[] in main.c. */
-    const pkt_rule_t rules[] =
-    {
-        { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 137u,
-          .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
-        { .match = RULE_ETHERTYPE, .ethertype = ETHERTYPE_ARP, .action = PKT_PASS },
-        { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 67u,
-          .action = PKT_PASS },
-    };
-    const uint32_t n = sizeof(rules) / sizeof(rules[0]);
-    int32_t      idx;
-    uint16_t     len;
-    pkt_filter_t f;
-    pkt_hdr_t    hdr;
-
-    /* NetBIOS broadcast from the laptop -> r0 RATE_LIMIT. A Windows group of
-     * 3 at once: 1 passes, 2 are rate-limited; a second later 1 passes again. */
-    len = build_udp(frame, IP4(169, 254, 236, 228), IP4(169, 254, 255, 255), 137u, 137u);
-    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_RATE_LIMIT);
-    CHECK_EQ(idx, 0);
-
-    CHECK(pkt_filter_init(&f, rules, n, PKT_DROP));
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 5000u, &hdr).action, PKT_PASS);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 5001u, &hdr).reason, DROP_REASON_RATE_LIMIT);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 5002u, &hdr).reason, DROP_REASON_RATE_LIMIT);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 6002u, &hdr).action, PKT_PASS);
-
-    /* ARP -> r1 PASS */
-    len = build_eth(frame, ETHERTYPE_ARP);
-    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_PASS);
-    CHECK_EQ(idx, 1);
-
-    /* DHCP Discover -> r2 PASS */
-    len = build_udp(frame, IP4(0, 0, 0, 0), IP4(255, 255, 255, 255), 68u, 67u);
-    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_PASS);
-    CHECK_EQ(idx, 2);
-
-    /* Anything else (TCP to port 80) -> default DROP */
-    len = build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 40000u, 80u);
-    CHECK_EQ(eval(rules, n, PKT_DROP, len, &idx), PKT_DROP);
-    CHECK_EQ(idx, -1);
-}
-
-/* ------------------------------------------------------------------------- */
 /* Pipeline + counters: pkt_filter_process()                                 */
 /* ------------------------------------------------------------------------- */
 
@@ -700,8 +651,6 @@ void run_pkt_filter_tests(void)
     RUN_TEST(test_port_rule_ignores_stale_ports);
     RUN_TEST(test_ip_rule_ignores_non_ip);
     RUN_TEST(test_port_rule_ignores_fragment);
-
-    RUN_TEST(test_demo_rule_table);
 
     RUN_TEST(test_init_rejects_too_many_rules);
     RUN_TEST(test_process_verdicts);

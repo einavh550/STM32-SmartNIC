@@ -17,8 +17,8 @@ CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-re
 endif
 
 # Firmware sources under test: the same files the STM32 build compiles.
-FW_SRC   := ../Core/Src/pkt_parse.c ../Core/Src/pkt_filter.c
-TEST_SRC := test_main.c test_pkt_parse.c test_pkt_filter.c
+FW_SRC   := ../Core/Src/pkt_parse.c ../Core/Src/pkt_filter.c ../Core/Src/filter_policy.c
+TEST_SRC := test_main.c test_pkt_parse.c test_pkt_filter.c test_filter_policy.c
 
 # Shell commands differ between Windows (cmd.exe) and Linux/macOS (sh).
 ifeq ($(OS),Windows_NT)
@@ -37,7 +37,7 @@ endif
 .PHONY: all test clean
 all: test
 
-$(BIN): $(FW_SRC) $(TEST_SRC) $(wildcard *.h) $(wildcard ../Core/Inc/pkt_*.h)
+$(BIN): $(FW_SRC) $(TEST_SRC) $(wildcard *.h) $(wildcard ../Core/Inc/pkt_*.h) ../Core/Inc/filter_policy.h
 	@$(MKDIR)
 	$(CC) $(CFLAGS) $(FW_SRC) $(TEST_SRC) -o $@
 

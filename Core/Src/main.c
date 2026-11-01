@@ -26,6 +26,7 @@
 #include "eth_rx.h"
 #include "pkt_parse.h"
 #include "pkt_filter.h"
+#include "filter_policy.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,27 +69,7 @@ COM_InitTypeDef BspCOMInit;
 ETH_HandleTypeDef heth;
 
 /* USER CODE BEGIN PV */
-/* Filter rules, checked top to bottom, first match wins.
- * Chosen to match the traffic a Windows PC sends on a direct cable. */
-static const pkt_rule_t filter_rules[] =
-{
-  /* 0: Windows NetBIOS name broadcasts: at most 1 per second, no burst.
-   *    Windows sends them in quick groups of 3, so most of each group is
-   *    rate-limited: a live demo of the token bucket. */
-  { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 137u,
-    .action = PKT_RATE_LIMIT, .rate_pps = 1u, .burst = 1u },
-  /* 1: pass ARP */
-  { .match = RULE_ETHERTYPE, .ethertype = ETHERTYPE_ARP,
-    .action = PKT_PASS },
-  /* 2: pass DHCP requests (client -> server port 67) */
-  { .match = RULE_IP_PROTO | RULE_DST_PORT, .ip_proto = IP_PROTO_UDP, .dst_port = 67u,
-    .action = PKT_PASS },
-};
-
-#define FILTER_RULE_COUNT   (sizeof(filter_rules) / sizeof(filter_rules[0]))
-#define FILTER_DEFAULT      PKT_DROP
-
-/* Rule table + counters. Used only by the main loop. */
+/* Rule table (filter_policy.c) + counters. Used only by the main loop. */
 static pkt_filter_t filter;
 /* USER CODE END PV */
 
@@ -182,9 +163,9 @@ int main(void)
    * 1. eth_rx_init() fills the free list,
    * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
    *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
-  if (!pkt_filter_init(&filter, filter_rules, FILTER_RULE_COUNT, FILTER_DEFAULT))
+  if (!pkt_filter_init(&filter, filter_policy, POLICY_RULE_COUNT, POLICY_DEFAULT_ACTION))
   {
-    printf("Too many filter rules\r\n");
+    printf("Invalid filter policy\r\n");
     Error_Handler();
   }
 
@@ -387,7 +368,7 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
   if (v.rule_idx >= 0)
   {
     /* A rate-limit drop also has a rule: say which rule and why. */
-    printf("  => %s (rule %ld%s)\r\n", verdict, (long)v.rule_idx,
+    printf("  => %s (%s%s)\r\n", verdict, filter_policy_rule_name(v.rule_idx),
            (v.reason == DROP_REASON_RATE_LIMIT) ? ", rate-limit" : "");
   }
   else if (v.action == PKT_PASS)
@@ -414,7 +395,7 @@ static void print_stats(void)
   printf(" | hits:");
   for (uint32_t i = 0u; i < filter.rule_count; i++)
   {
-    printf(" r%lu:%lu", (unsigned long)i, (unsigned long)filter.rule_hits[i]);
+    printf(" %s:%lu", filter_policy_rule_name((int32_t)i), (unsigned long)filter.rule_hits[i]);
   }
 
   printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
