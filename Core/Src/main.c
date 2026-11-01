@@ -24,6 +24,9 @@
 /* USER CODE BEGIN Includes */
 #include "ring_buffer_test.h"
 #include "eth_rx.h"
+#include "pkt_parse.h"
+#include "pkt_filter.h"
+#include "filter_policy.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,7 +36,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,7 +69,8 @@ COM_InitTypeDef BspCOMInit;
 ETH_HandleTypeDef heth;
 
 /* USER CODE BEGIN PV */
-
+/* Rule table (filter_policy.c) + counters. Used only by the main loop. */
+static pkt_filter_t filter;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,7 +79,8 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v);
+static void print_stats(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -158,6 +163,12 @@ int main(void)
    * 1. eth_rx_init() fills the free list,
    * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
    *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
+  if (!pkt_filter_init(&filter, filter_policy, POLICY_RULE_COUNT, POLICY_DEFAULT_ACTION))
+  {
+    printf("Invalid filter policy\r\n");
+    Error_Handler();
+  }
+
   eth_rx_init();
   if (HAL_ETH_Start_IT(&heth) != HAL_OK)
   {
@@ -172,13 +183,27 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t last_stats_ms;
     pkt_desc_t pkt;
+    pkt_hdr_t  hdr;
 
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
-      printf("RX frame: %u bytes\r\n", (unsigned)pkt.len);
+      /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
+      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, HAL_GetTick(), &hdr);
+
+      log_frame(pkt.len, &hdr, v);
+
+      /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
+    }
+
+    /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
+    if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
+    {
+      last_stats_ms = HAL_GetTick();
+      print_stats();
     }
   }
   /* USER CODE END 3 */
@@ -305,7 +330,76 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/** Print one line per frame: what it is and what the filter decided. */
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
+{
+  printf("RX %4u  ", (unsigned)len);
 
+  if ((hdr->valid & PKT_HAS_IPV4) != 0u)
+  {
+    printf("IPv4 %u.%u.%u.%u -> %u.%u.%u.%u p%u",
+           (unsigned)(hdr->src_ip >> 24), (unsigned)((hdr->src_ip >> 16) & 0xFFu),
+           (unsigned)((hdr->src_ip >> 8) & 0xFFu), (unsigned)(hdr->src_ip & 0xFFu),
+           (unsigned)(hdr->dst_ip >> 24), (unsigned)((hdr->dst_ip >> 16) & 0xFFu),
+           (unsigned)((hdr->dst_ip >> 8) & 0xFFu), (unsigned)(hdr->dst_ip & 0xFFu),
+           (unsigned)hdr->ip_proto);
+
+    if ((hdr->valid & PKT_HAS_L4) != 0u)
+    {
+      printf(" %u->%u", (unsigned)hdr->src_port, (unsigned)hdr->dst_port);
+
+      if (hdr->ip_proto == IP_PROTO_TCP)
+      {
+        printf(" flags 0x%02X", (unsigned)hdr->tcp_flags);
+      }
+    }
+  }
+  else if ((hdr->valid & PKT_HAS_ETH) != 0u)
+  {
+    printf("type 0x%04X", (unsigned)hdr->ethertype);
+  }
+  else
+  {
+    printf("too short");
+  }
+
+  const char *verdict = (v.action == PKT_PASS) ? "PASS" : "DROP";
+
+  if (v.rule_idx >= 0)
+  {
+    /* A rate-limit drop also has a rule: say which rule and why. */
+    printf("  => %s (%s%s)\r\n", verdict, filter_policy_rule_name(v.rule_idx),
+           (v.reason == DROP_REASON_RATE_LIMIT) ? ", rate-limit" : "");
+  }
+  else if (v.action == PKT_PASS)
+  {
+    printf("  => %s (default)\r\n", verdict);
+  }
+  else
+  {
+    /* malformed, spoofed, tcp-scan or default */
+    printf("  => %s (%s)\r\n", verdict, pkt_drop_reason_name(v.reason));
+  }
+}
+
+/** Print the filter counters: totals, drops per reason, hits per rule. */
+static void print_stats(void)
+{
+  printf("--- passed %lu | dropped:", (unsigned long)filter.passed);
+
+  for (uint32_t r = DROP_REASON_NONE + 1u; r < DROP_REASON_COUNT; r++)
+  {
+    printf(" %s %lu", pkt_drop_reason_name((pkt_drop_reason_t)r), (unsigned long)filter.dropped[r]);
+  }
+
+  printf(" | hits:");
+  for (uint32_t i = 0u; i < filter.rule_count; i++)
+  {
+    printf(" %s:%lu", filter_policy_rule_name((int32_t)i), (unsigned long)filter.rule_hits[i]);
+  }
+
+  printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
+}
 /* USER CODE END 4 */
 
  /* MPU Configuration */

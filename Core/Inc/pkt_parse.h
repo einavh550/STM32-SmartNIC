@@ -1,0 +1,128 @@
+/**
+ * @file    pkt_parse.h
+ * @brief   Header parser for received Ethernet frames.
+ *
+ * @note    Pure C, no HAL or hardware access, so it can also be built and
+ *          unit-tested on a PC.
+ */
+
+#ifndef INC_PKT_PARSE_H_
+#define INC_PKT_PARSE_H_
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ------------------------------------------------------------------------- */
+/* Configuration                                                             */
+/* ------------------------------------------------------------------------- */
+
+#define ETH_MAC_LEN         (6u)    /**< Bytes in a MAC address.                 */
+#define ETH_HDR_LEN         (14u)   /**< dst MAC (6) + src MAC (6) + EtherType (2). */
+
+#define ETHERTYPE_IPV4      (0x0800u)
+#define ETHERTYPE_ARP       (0x0806u)
+#define ETHERTYPE_IPV6      (0x86DDu)
+
+#define IPV4_MIN_HDR_LEN    (20u)   /**< IPv4 header without options.            */
+
+#define IP_PROTO_ICMP       (1u)
+#define IP_PROTO_TCP        (6u)
+#define IP_PROTO_UDP        (17u)
+
+#define UDP_HDR_LEN         (8u)
+#define TCP_MIN_HDR_LEN     (20u)   /**< TCP header without options.             */
+
+/* TCP flag bits (byte 13 of the TCP header). */
+#define TCP_FLAG_FIN        (0x01u) /**< Sender is done sending.                 */
+#define TCP_FLAG_SYN        (0x02u) /**< Open a connection.                      */
+#define TCP_FLAG_RST        (0x04u) /**< Abort the connection.                   */
+#define TCP_FLAG_PSH        (0x08u) /**< Deliver data now.                       */
+#define TCP_FLAG_ACK        (0x10u) /**< Acknowledges received data.             */
+#define TCP_FLAG_URG        (0x20u) /**< Urgent pointer is valid.                */
+#define TCP_FLAG_ECE        (0x40u) /**< ECN echo (congestion signal).           */
+#define TCP_FLAG_CWR        (0x80u) /**< Congestion window reduced.              */
+
+/* Bits of pkt_hdr_t.valid: which layers were parsed successfully. */
+#define PKT_HAS_ETH         (1u << 0)
+#define PKT_HAS_IPV4        (1u << 1)
+#define PKT_HAS_L4          (1u << 2)
+
+/* ------------------------------------------------------------------------- */
+/* Types                                                                     */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief Header fields extracted from one frame, in host byte order.
+ *
+ * Filled by the parser, read by the filter. Holds copies of a few fields,
+ * not the frame itself.
+ */
+typedef struct
+{
+    uint8_t  dst_mac[ETH_MAC_LEN];
+    uint8_t  src_mac[ETH_MAC_LEN];
+    uint16_t ethertype;
+    uint8_t  valid;        /**< PKT_HAS_* bits: which fields below can be trusted. */
+
+    /* IPv4, valid only after pkt_parse_ipv4() returned true. */
+    uint32_t src_ip;       /**< e.g. 192.168.1.5 is 0xC0A80105.                 */
+    uint32_t dst_ip;
+    uint8_t  ip_proto;     /**< What follows the IP header: TCP, UDP, ICMP...   */
+    uint16_t l4_offset;    /**< Offset of the TCP/UDP header from frame start.  */
+    uint16_t ip_total_len; /**< IP header + payload, from the header. The frame
+                                can be longer (Ethernet padding), never shorter. */
+    uint16_t ip_frag_off;  /**< Fragment offset in 8-byte units, 0 = first piece. */
+
+    /* TCP/UDP, valid only after pkt_parse_l4() returned true (PKT_HAS_L4). */
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t  tcp_flags;    /**< TCP_FLAG_* bits; 0 for UDP.                     */
+} pkt_hdr_t;
+
+/* ------------------------------------------------------------------------- */
+/* Public API                                                                */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief  Parse the Ethernet header at the start of a frame.
+ * @param  frame  First byte of the frame (destination MAC).
+ * @param  len    Frame length in bytes.
+ * @param  out    Filled with the parsed fields on success.
+ * @return true on success, false if the frame is too short (*out untouched).
+ */
+bool pkt_parse_eth(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
+/**
+ * @brief  Parse the IPv4 header that follows the Ethernet header.
+ * @note   Call only after pkt_parse_eth() succeeded and out->ethertype is IPv4.
+ *         VLAN-tagged frames are not supported yet.
+ * @return true on success, false if the header is truncated or invalid, or
+ *         its total length is smaller than the header or larger than the frame.
+ */
+bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
+/**
+ * @brief  Read the ports of a TCP or UDP header, and the flags of a TCP header.
+ * @note   Call only after pkt_parse_ipv4() succeeded.
+ * @return true on success, false if the protocol is not TCP/UDP, the packet is
+ *         a non-first fragment (no L4 header in it), the header is truncated,
+ *         or the TCP header length field is below 20 or past the packet end.
+ */
+bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
+/**
+ * @brief  Parse every layer the frame has: Ethernet, then IPv4, then TCP/UDP.
+ *
+ * A layer that is simply absent is fine (ARP has no IP header, ICMP has no
+ * ports, a non-first fragment has no L4 header). A layer the frame CLAIMS to
+ * have but that is broken makes the whole frame malformed: EtherType says IPv4
+ * but the IPv4 header is invalid, the protocol says TCP/UDP but that header
+ * does not fit in the IP packet (this includes tiny first fragments), or a TCP
+ * fragment sits at offset 1 (overlapping-fragment attack, RFC 1858).
+ *
+ * @return true if the frame is well formed (out->valid says which layers were
+ *         found), false if it is malformed and should be dropped.
+ */
+bool pkt_parse_frame(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
+#endif /* INC_PKT_PARSE_H_ */

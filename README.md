@@ -1,8 +1,11 @@
 # STM32-SmartNIC
 
+[![host-tests](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml)
+
 Bare-metal firmware that turns an STM32H723 into a simple SmartNIC: it receives
 Ethernet frames through the MAC's DMA, hands them from the interrupt to the main
-loop without copying, and (in later phases) filters them by header fields.
+loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers and runs
+them through a first-match rule filter.
 A BeagleBone Black on the other end of the cable acts as the traffic generator.
 
 ## Hardware
@@ -19,7 +22,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 |-------|-----------------------------------------------|-------------|
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
-| 3     | Header filtering (MAC / IP / port)            | Next        |
+| 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Planned  |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
@@ -61,6 +64,102 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   non-cacheable, so the CPU always sees what the DMA wrote without manual cache
   maintenance.
 
+**Header parser (`pkt_parse.c`)**
+- Parses layer by layer, each step only if the previous one succeeded:
+  Ethernet (MACs, EtherType) -> IPv4 (addresses, protocol, header length,
+  fragment offset) -> TCP/UDP (ports).
+- Fields are read byte by byte with explicit big-endian helpers instead of
+  casting a struct over the buffer: no alignment or padding assumptions.
+- Every read is bounds-checked against the frame length; a truncated or
+  inconsistent header (wrong version, IHL < 5, options past the end) is rejected.
+- IPv4 options are supported through the IHL field (`l4_offset = 14 + IHL * 4`).
+- The IPv4 total length is checked against the frame: smaller than the header,
+  or larger than what arrived, is malformed. A longer frame is accepted
+  (Ethernet pads short frames to 60 bytes), and the TCP/UDP header must fit
+  inside the IP packet, so padding bytes are never read as ports.
+- RFC 1858 fragment attacks are dropped as malformed: a first TCP fragment too
+  small to hold the full TCP header (tiny fragment), and a TCP fragment at
+  offset 1 that would overwrite the TCP flags (overlapping fragment).
+- Non-first IP fragments carry no L4 header, so no ports are read from them.
+- TCP: the flags byte is read, and the header length field (data offset) must
+  be at least 20 bytes and fit inside the IP packet.
+- `pkt_hdr_t.valid` records which layers were parsed (`PKT_HAS_ETH/IPV4/L4`).
+- Pure C, no HAL: the same file is compiled for the board and for host tests.
+
+**Rule filter (`pkt_filter.c`)**
+- `pkt_filter_process()` is the whole per-frame pipeline. Each stage either
+  decides or hands the frame to the next one; the fixed checks run before the
+  rule table, so no rule can let a bad frame through:
+  1. **sanity**: malformed frames are dropped;
+  2. **anti-spoofing**: source addresses no honest sender can have
+     ("martians", RFC 1812 / RFC 5735) are dropped: a multicast/broadcast
+     source MAC, a loopback (127/8), multicast, reserved or broadcast source
+     IP, source 0.0.0.0 (allowed only for a DHCP request, UDP 68 -> 67), and
+     source == destination (LAND attack). Which subnets may send on this link
+     (ingress filtering, BCP 38) is policy and belongs in the rule table;
+  3. **TCP scan detection**: the TCP flags must be a combination a real TCP
+     stack sends. A 32-entry whitelist (the same idea as Linux
+     `nf_conntrack`) drops NULL, FIN, XMAS, SYN+FIN, SYN+RST scans in one
+     table lookup. Stateless, so ACK / FIN+ACK scans are not caught;
+  4. **rule table**, with actions PASS, DROP and RATE_LIMIT.
+
+  It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
+- A frame is malformed when a layer it claims to have is broken (EtherType
+  says IPv4 but the header or its length is invalid, protocol says TCP/UDP but
+  the header does not fit, RFC 1858 fragments). An absent layer is not an
+  error (ARP, ICMP, later fragments).
+- Ordered rule table, first match wins, default action if nothing matches
+  (like a firewall rule list).
+- A rule compares only the fields named in its `match` bits: EtherType,
+  IP protocol, source/destination IP under a mask (subnets), ports, and TCP
+  flags under a mask (e.g. mask `SYN|ACK`, value `SYN` = new connection).
+- A rule that asks about a layer the frame does not have never matches, so a
+  port rule cannot hit an ARP frame through stale fields.
+- **Rate limiting (flood protection):** a `PKT_RATE_LIMIT` rule passes
+  matching frames through a token bucket: `rate_pps` tokens per second, at
+  most `burst` stored, one token per frame, the rest is dropped as
+  `rate-limit`. Example: a rule on TCP flags `SYN` without `ACK` with
+  10/s, burst 3 limits new connections (SYN flood) while data packets of open
+  connections are not slowed down.
+  - Tokens are kept in thousandths, so the refill `elapsed_ms * rate_pps` is
+    exact integer math (no float, no rounding loss); 64-bit for the product,
+    so even a gap of days cannot overflow.
+  - Time comes from the caller (`HAL_GetTick()` on the board, a fake clock in
+    the tests), which keeps the filter free of HAL. Tick wrap-around after
+    49.7 days is handled by unsigned subtraction.
+  - Each rule has its own bucket in `pkt_filter_t`; the rule table stays `const`.
+  - The limit is per rule (aggregate): all senders matching a rule share one
+    bucket. That protects the board from any number of senders, but a flood
+    also uses up the share of honest senders (see limitations).
+- The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
+  statistics: per-rule hits, default hits, passed frames and drops per reason
+  (`malformed`, `spoofed`, `tcp-scan`, `rate-limit`, `rule`, `default`). The
+  main loop prints them every 5 s (example numbers):
+  ```
+  --- passed 7 | dropped: malformed 0 spoofed 0 tcp-scan 0 rate-limit 0 rule 0 default 14 | hits: arp:7 ping:0 tcp-new:0 tcp:0 udp-test:0 default:14 ---
+  ```
+
+**Filter policy (`filter_policy.c`)**
+
+The rule table the board runs, for a direct cable to the BeagleBone Black on
+`192.168.10.0/24` (board `.1`, BBB `.2`). It lives in its own file so the host
+tests check exactly this table. Default deny: anything not listed is dropped.
+
+| # | Name       | Matches                                         | Action                 | Protects against |
+|---|------------|-------------------------------------------------|------------------------|------------------|
+| 0 | `arp`      | ARP                                             | rate limit 20/s, burst 10 | ARP storm     |
+| 1 | `ping`     | ICMP, link subnet -> board                      | rate limit 10/s, burst 5  | ping flood    |
+| 2 | `tcp-new`  | TCP SYN without ACK, link subnet -> board:80    | rate limit 20/s, burst 5  | SYN flood     |
+| 3 | `tcp`      | other TCP, link subnet -> board:80              | pass                   |                  |
+| 4 | `udp-test` | UDP, link subnet -> board:5000                  | pass, no limit         | (throughput tests measure the board, not the limiter) |
+| - | default    | everything else                                 | drop                   | unlisted services, other subnets, IPv6 |
+
+- Every IP rule requires a source in the link subnet and the board as
+  destination: ingress filtering (BCP 38) is part of the policy.
+- `tcp` can pass every flag combination it sees, because scans were already
+  dropped by the scan stage and new connections were already caught by `tcp-new`.
+- Rate numbers are first guesses, to be tuned from measurements in Phase 4.
+
 **HAL integration**
 - Uses the HAL ETH driver's buffer callbacks (`RxAllocateCallback`,
   `RxLinkCallback`) so the driver works directly on the pool buffers.
@@ -85,6 +184,36 @@ RX frame: 60 bytes
 RX frame: 110 bytes
 ```
 
+- **Parser and filter on hardware:** live traffic from a PC was decoded as ARP
+  (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
+  NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
+  pass UDP:67, default drop) the per-rule counters matched the traffic seen.
+- **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
+  `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
+  TCP, byte order, truncated and malformed headers, lying IP total length,
+  Ethernet padding, IPv4 and TCP options, fragments and RFC 1858 fragment
+  attacks, real TCP flag combinations vs. NULL / FIN / XMAS scans, TCP flag rules,
+  spoofed sources (loopback, multicast, broadcast, 0.0.0.0 outside DHCP, LAND,
+  group source MAC), the token bucket (burst, refill, cap, tick wrap,
+  overflow, SYN flood), the shipped policy (BBB traffic, SYN / ping / ARP
+  floods, ingress filtering, unlisted services),
+  first-match order, subnet masks, stale-field protection,
+  and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
+  AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
+
+## Running the unit tests
+
+Needs a host GCC (Linux/macOS: `gcc` + `make`; Windows: e.g. WinLibs GCC,
+where make is called `mingw32-make`).
+
+```
+cd tests
+make            # Windows: mingw32-make
+make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
+```
+
+Expected last line: `380 checks, 0 failed: PASS`.
+
 ## Build and flash
 
 Toolchain: STM32CubeIDE 2.x (GCC arm-none-eabi). Peripheral setup is generated
@@ -105,7 +234,12 @@ Core/Inc, Core/Src
   ring_buffer.[ch]       SPSC ring buffer
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue
-  main.c                 init sequence and main loop
+  pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
+  pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
+  filter_policy.[ch]     the rule table the board runs (BBB link)
+  main.c                 init sequence, main loop, rule table and counters
+tests/                   host unit tests (parser, filter) + Makefile
+.github/workflows/       CI: runs the host tests on every push
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
 STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 ```
@@ -119,3 +253,16 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The `flags` field of the packet descriptor is not filled yet (no per-frame
   error reporting).
+- The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
+  IPv6 are classified by EtherType but not parsed further.
+- The filter is stateless (no connection tracking): ACK / FIN+ACK scans look
+  like normal traffic, and a spoofed source that looks valid (inside the link
+  subnet) cannot be told apart from a real one. ARP is not inspected (no
+  ARP-spoofing detection).
+- Rate limits are per rule, shared by all senders: a flood is capped, but it
+  also takes the share of honest senders. Per-source buckets (a hash table
+  keyed by source IP, plus the total cap) would make it fair.
+- No device can stop a flood larger than its link: that has to be filtered
+  upstream.
+- Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is
+  done by requiring the subnet in every allow rule.
