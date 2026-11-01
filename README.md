@@ -1,8 +1,11 @@
 # STM32-SmartNIC
 
+[![host-tests](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml)
+
 Bare-metal firmware that turns an STM32H723 into a simple SmartNIC: it receives
 Ethernet frames through the MAC's DMA, hands them from the interrupt to the main
-loop without copying, and (in later phases) filters them by header fields.
+loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers and runs
+them through a first-match rule filter.
 A BeagleBone Black on the other end of the cable acts as the traffic generator.
 
 ## Hardware
@@ -19,7 +22,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 |-------|-----------------------------------------------|-------------|
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
-| 3     | Header filtering (MAC / IP / port)            | Next        |
+| 3     | Header parsing and rule filter (EtherType / IP / port) | In progress: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Planned  |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
@@ -61,6 +64,29 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
   non-cacheable, so the CPU always sees what the DMA wrote without manual cache
   maintenance.
 
+**Header parser (`pkt_parse.c`)**
+- Parses layer by layer, each step only if the previous one succeeded:
+  Ethernet (MACs, EtherType) -> IPv4 (addresses, protocol, header length,
+  fragment offset) -> TCP/UDP (ports).
+- Fields are read byte by byte with explicit big-endian helpers instead of
+  casting a struct over the buffer: no alignment or padding assumptions.
+- Every read is bounds-checked against the frame length; a truncated or
+  inconsistent header (wrong version, IHL < 5, options past the end) is rejected.
+- IPv4 options are supported through the IHL field (`l4_offset = 14 + IHL * 4`).
+- Non-first IP fragments carry no L4 header, so no ports are read from them.
+- `pkt_hdr_t.valid` records which layers were parsed (`PKT_HAS_ETH/IPV4/L4`).
+- Pure C, no HAL: the same file is compiled for the board and for host tests.
+
+**Rule filter (`pkt_filter.c`)**
+- Ordered rule table, first match wins, default action if nothing matches
+  (like a firewall rule list).
+- A rule compares only the fields named in its `match` bits: EtherType,
+  IP protocol, source/destination IP under a mask (subnets), ports.
+- A rule that asks about a layer the frame does not have never matches, so a
+  port rule cannot hit an ARP frame through stale fields.
+- The rule table is `const`; per-rule hit counters, pass/drop totals and the
+  default-action count are kept by the caller and printed every 5 s.
+
 **HAL integration**
 - Uses the HAL ETH driver's buffer callbacks (`RxAllocateCallback`,
   `RxLinkCallback`) so the driver works directly on the pool buffers.
@@ -85,6 +111,30 @@ RX frame: 60 bytes
 RX frame: 110 bytes
 ```
 
+- **Parser and filter on hardware:** live traffic from a PC was decoded as ARP
+  (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
+  NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
+  pass UDP:67, default drop) the per-rule counters matched the traffic seen.
+- **Host unit tests:** 29 tests (117 checks) build `pkt_parse.c` and
+  `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
+  TCP, byte order, truncated and malformed headers, IPv4 options, fragments,
+  first-match order, subnet masks, stale-field protection and the demo rule
+  table end to end. GitHub Actions runs them on every push with
+  AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
+
+## Running the unit tests
+
+Needs a host GCC (Linux/macOS: `gcc` + `make`; Windows: e.g. WinLibs GCC,
+where make is called `mingw32-make`).
+
+```
+cd tests
+make            # Windows: mingw32-make
+make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
+```
+
+Expected last line: `117 checks, 0 failed: PASS`.
+
 ## Build and flash
 
 Toolchain: STM32CubeIDE 2.x (GCC arm-none-eabi). Peripheral setup is generated
@@ -105,7 +155,11 @@ Core/Inc, Core/Src
   ring_buffer.[ch]       SPSC ring buffer
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue
-  main.c                 init sequence and main loop
+  pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
+  pkt_filter.[ch]        first-match rule filter
+  main.c                 init sequence, main loop, rule table and counters
+tests/                   host unit tests (parser, filter) + Makefile
+.github/workflows/       CI: runs the host tests on every push
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
 STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 ```
@@ -119,3 +173,7 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The `flags` field of the packet descriptor is not filled yet (no per-frame
   error reporting).
+- The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
+  IPv6 are classified by EtherType but not parsed further.
+- The current rule table is a demo for a PC link; the real policy (anti-spoofing,
+  scan and flood protection) is designed together with the BBB tests.
