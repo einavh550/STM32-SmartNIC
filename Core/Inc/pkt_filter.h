@@ -26,6 +26,9 @@
 #define RULE_SRC_PORT       (1u << 4)
 #define RULE_DST_PORT       (1u << 5)
 
+/** Most rules one filter can hold (size of the per-rule hit counter array). */
+#define PKT_FILTER_MAX_RULES    (16u)
+
 /* ------------------------------------------------------------------------- */
 /* Types                                                                     */
 /* ------------------------------------------------------------------------- */
@@ -57,6 +60,42 @@ typedef struct
     uint8_t      ip_proto;
 } pkt_rule_t;
 
+/** Why a frame was dropped. Later stages (spoofing, scans, rate limit) add more. */
+typedef enum
+{
+    DROP_REASON_NONE = 0,       /**< Not dropped: the frame passed.               */
+    DROP_REASON_MALFORMED,      /**< A header the frame claims to have is broken. */
+    DROP_REASON_RULE,           /**< A rule with action DROP matched.             */
+    DROP_REASON_DEFAULT,        /**< No rule matched and the default is DROP.     */
+    DROP_REASON_COUNT           /**< Number of reasons (array size), not a reason. */
+} pkt_drop_reason_t;
+
+/** The decision for one frame. */
+typedef struct
+{
+    pkt_action_t      action;
+    pkt_drop_reason_t reason;   /**< DROP_REASON_NONE when action is PKT_PASS.     */
+    int32_t           rule_idx; /**< Matching rule, or -1 (default or malformed).  */
+} pkt_verdict_t;
+
+/**
+ * @brief A filter instance: the rule table plus its statistics.
+ *
+ * Counters are only written by pkt_filter_process(), from one context
+ * (the main loop), so they need no locking.
+ */
+typedef struct
+{
+    const pkt_rule_t *rules;
+    uint32_t          rule_count;
+    pkt_action_t      default_action;
+
+    uint32_t rule_hits[PKT_FILTER_MAX_RULES]; /**< Frames matched by each rule.       */
+    uint32_t default_hits;                    /**< Well-formed frames no rule matched. */
+    uint32_t passed;                          /**< Frames with action PASS.            */
+    uint32_t dropped[DROP_REASON_COUNT];      /**< Drops per reason ([NONE] stays 0).  */
+} pkt_filter_t;
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                */
 /* ------------------------------------------------------------------------- */
@@ -75,5 +114,23 @@ typedef struct
 pkt_action_t pkt_filter_eval(const pkt_rule_t *rules, uint32_t count,
                              pkt_action_t default_action, const pkt_hdr_t *hdr,
                              int32_t *rule_idx);
+
+/**
+ * @brief  Set up a filter and zero its counters.
+ * @return false if count is larger than PKT_FILTER_MAX_RULES.
+ */
+bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
+                     pkt_action_t default_action);
+
+/**
+ * @brief  Full pipeline for one frame: parse, drop if malformed, else run the
+ *         rules. Updates the filter's counters.
+ * @param  hdr  Filled with the parsed headers (useful for logging).
+ */
+pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
+                                 pkt_hdr_t *hdr);
+
+/** Short name of a drop reason for logs, e.g. "malformed". */
+const char *pkt_drop_reason_name(pkt_drop_reason_t reason);
 
 #endif /* INC_PKT_FILTER_H_ */

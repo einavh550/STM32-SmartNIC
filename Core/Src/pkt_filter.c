@@ -8,6 +8,7 @@
  */
 
 #include <stdbool.h>
+#include <string.h>
 #include "pkt_filter.h"
 
 static bool rule_matches(const pkt_rule_t *r, const pkt_hdr_t *hdr)
@@ -73,4 +74,73 @@ pkt_action_t pkt_filter_eval(const pkt_rule_t *rules, uint32_t count,
 
     *rule_idx = -1;
     return default_action;
+}
+
+bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
+                     pkt_action_t default_action)
+{
+    if (count > PKT_FILTER_MAX_RULES)
+    {
+        return false;
+    }
+
+    memset(f, 0, sizeof(*f));         /* all counters start at 0 */
+    f->rules          = rules;
+    f->rule_count     = count;
+    f->default_action = default_action;
+
+    return true;
+}
+
+pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
+                                 pkt_hdr_t *hdr)
+{
+    /* Start from "malformed": that is the answer if parsing fails. */
+    pkt_verdict_t v = { .action = PKT_DROP, .reason = DROP_REASON_MALFORMED, .rule_idx = -1 };
+
+    /* Stage 1: sanity. A broken frame never reaches the rules. */
+    if (pkt_parse_frame(frame, len, hdr))
+    {
+        /* Stage 2: the rule table. */
+        v.action = pkt_filter_eval(f->rules, f->rule_count, f->default_action, hdr, &v.rule_idx);
+
+        if (v.rule_idx >= 0)
+        {
+            f->rule_hits[v.rule_idx]++;
+            v.reason = DROP_REASON_RULE;
+        }
+        else
+        {
+            f->default_hits++;
+            v.reason = DROP_REASON_DEFAULT;
+        }
+
+        if (v.action == PKT_PASS)
+        {
+            v.reason = DROP_REASON_NONE;
+        }
+    }
+
+    if (v.action == PKT_PASS)
+    {
+        f->passed++;
+    }
+    else
+    {
+        f->dropped[v.reason]++;
+    }
+
+    return v;
+}
+
+const char *pkt_drop_reason_name(pkt_drop_reason_t reason)
+{
+    switch (reason)
+    {
+        case DROP_REASON_NONE:      return "none";
+        case DROP_REASON_MALFORMED: return "malformed";
+        case DROP_REASON_RULE:      return "rule";
+        case DROP_REASON_DEFAULT:   return "default";
+        default:                    return "?";
+    }
 }

@@ -84,7 +84,9 @@ static inline uint16_t build_tcp(uint8_t *f, uint32_t src, uint32_t dst,
     return ETH_HDR_LEN + IPV4_MIN_HDR_LEN + TCP_MIN_HDR_LEN;
 }
 
-/** Same parse chain as the main loop in main.c. */
+/** Parse every layer that is present, without judging if the frame is
+ *  malformed (that is pkt_parse_frame()'s job). Lets tests look at what each
+ *  single parser step did. */
 static inline bool parse_all(const uint8_t *f, uint16_t len, pkt_hdr_t *hdr)
 {
     if (!pkt_parse_eth(f, len, hdr))

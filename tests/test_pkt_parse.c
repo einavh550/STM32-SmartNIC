@@ -238,6 +238,85 @@ static void test_l4_non_first_fragment_has_no_ports(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Whole frame: pkt_parse_frame()                                            */
+/* ------------------------------------------------------------------------- */
+
+static void test_frame_good_udp(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_udp(frame, 1u, 2u, 68u, 67u);
+
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+    CHECK_EQ(hdr.valid, PKT_HAS_ETH | PKT_HAS_IPV4 | PKT_HAS_L4);
+    CHECK_EQ(hdr.dst_port, 67u);
+}
+
+static void test_frame_arp_and_ipv6_are_fine(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len;
+
+    len = build_eth(frame, ETHERTYPE_ARP);
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+    CHECK_EQ(hdr.valid, PKT_HAS_ETH);
+
+    len = build_eth(frame, ETHERTYPE_IPV6);           /* not parsed further, not broken */
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+    CHECK_EQ(hdr.valid, PKT_HAS_ETH);
+}
+
+static void test_frame_too_short_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+
+    /* Fill hdr from a good frame first: valid must not keep its old bits. */
+    uint16_t len = build_udp(frame, 1u, 2u, 1u, 2u);
+    CHECK(pkt_parse_frame(frame, len, &hdr));
+
+    CHECK(!pkt_parse_frame(frame, 10u, &hdr));
+    CHECK_EQ(hdr.valid, 0u);
+}
+
+static void test_frame_broken_ipv4_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len = build_udp(frame, 1u, 2u, 1u, 2u);
+
+    frame[ETH_HDR_LEN] = 0x65;                        /* EtherType says IPv4, version says 6 */
+    CHECK(!pkt_parse_frame(frame, len, &hdr));
+}
+
+static void test_frame_truncated_l4_is_malformed(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len;
+
+    len = build_udp(frame, 1u, 2u, 1u, 2u);
+    CHECK(!pkt_parse_frame(frame, len - 1u, &hdr));   /* 7-byte UDP header */
+
+    len = build_tcp(frame, 1u, 2u, 1u, 2u);
+    CHECK(!pkt_parse_frame(frame, len - 12u, &hdr));  /* 8-byte TCP header */
+}
+
+static void test_frame_icmp_and_fragment_are_fine(void)
+{
+    pkt_hdr_t hdr;
+    uint16_t  len;
+
+    /* ICMP has no ports: not malformed. */
+    len = build_ipv4(frame, IP_PROTO_ICMP, 1u, 2u);
+    memset(&frame[len], 0, 8);
+    CHECK(pkt_parse_frame(frame, len + 8u, &hdr));
+    CHECK_EQ(hdr.valid, PKT_HAS_ETH | PKT_HAS_IPV4);
+
+    /* A later fragment has no UDP header, even if it is only 2 bytes long. */
+    len = build_ipv4(frame, IP_PROTO_UDP, 1u, 2u);
+    wr_be16(&frame[ETH_HDR_LEN + 6], 185u);
+    CHECK(pkt_parse_frame(frame, len + 2u, &hdr));
+    CHECK_EQ(hdr.valid, PKT_HAS_ETH | PKT_HAS_IPV4);
+}
+
+/* ------------------------------------------------------------------------- */
 
 void run_pkt_parse_tests(void)
 {
@@ -261,4 +340,11 @@ void run_pkt_parse_tests(void)
     RUN_TEST(test_l4_short_tcp_is_rejected);
     RUN_TEST(test_l4_icmp_has_no_ports);
     RUN_TEST(test_l4_non_first_fragment_has_no_ports);
+
+    RUN_TEST(test_frame_good_udp);
+    RUN_TEST(test_frame_arp_and_ipv6_are_fine);
+    RUN_TEST(test_frame_too_short_is_malformed);
+    RUN_TEST(test_frame_broken_ipv4_is_malformed);
+    RUN_TEST(test_frame_truncated_l4_is_malformed);
+    RUN_TEST(test_frame_icmp_and_fragment_are_fine);
 }

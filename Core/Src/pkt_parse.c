@@ -115,3 +115,35 @@ bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
 
     return true;
 }
+
+bool pkt_parse_frame(const uint8_t *frame, uint16_t len, pkt_hdr_t *out)
+{
+    /* pkt_parse_eth() leaves *out untouched on failure: clear the layer bits
+     * here so nothing from the previous frame survives. */
+    out->valid = 0u;
+
+    if (!pkt_parse_eth(frame, len, out))
+    {
+        return false;                 /* not even an Ethernet header */
+    }
+
+    if (out->ethertype != ETHERTYPE_IPV4)
+    {
+        return true;                  /* ARP, IPv6...: nothing more we parse */
+    }
+
+    if (!pkt_parse_ipv4(frame, len, out))
+    {
+        return false;                 /* says IPv4, but the header is broken */
+    }
+
+    const bool has_ports = ((out->ip_proto == IP_PROTO_TCP) || (out->ip_proto == IP_PROTO_UDP)) &&
+                           (out->ip_frag_off == 0u);
+
+    if (has_ports)
+    {
+        return pkt_parse_l4(frame, len, out);   /* false = TCP/UDP header truncated */
+    }
+
+    return true;                      /* ICMP, or a later fragment: no ports */
+}

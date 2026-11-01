@@ -86,11 +86,8 @@ static const pkt_rule_t filter_rules[] =
 #define FILTER_RULE_COUNT   (sizeof(filter_rules) / sizeof(filter_rules[0]))
 #define FILTER_DEFAULT      PKT_DROP
 
-/* Counters, written only by the main loop. */
-static uint32_t rule_hits[FILTER_RULE_COUNT];
-static uint32_t default_hits;
-static uint32_t frames_passed;
-static uint32_t frames_dropped;
+/* Rule table + counters. Used only by the main loop. */
+static pkt_filter_t filter;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,7 +96,7 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_action_t action, int32_t rule_idx);
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v);
 static void print_stats(void);
 /* USER CODE END PFP */
 
@@ -183,6 +180,12 @@ int main(void)
    * 1. eth_rx_init() fills the free list,
    * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
    *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
+  if (!pkt_filter_init(&filter, filter_rules, FILTER_RULE_COUNT, FILTER_DEFAULT))
+  {
+    printf("Too many filter rules\r\n");
+    Error_Handler();
+  }
+
   eth_rx_init();
   if (HAL_ETH_Start_IT(&heth) != HAL_OK)
   {
@@ -204,49 +207,10 @@ int main(void)
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
-      pkt_action_t action;
-      int32_t      rule_idx;
+      /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
+      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, &hdr);
 
-      /* 1. Parse as many layers as the frame has. Each step needs the one before. */
-      if (pkt_parse_eth(pkt.data, pkt.len, &hdr))
-      {
-        if ((hdr.ethertype == ETHERTYPE_IPV4) && pkt_parse_ipv4(pkt.data, pkt.len, &hdr))
-        {
-          (void)pkt_parse_l4(pkt.data, pkt.len, &hdr);   /* fails for ICMP etc.: fine */
-        }
-
-        /* 2. Ask the filter. */
-        action = pkt_filter_eval(filter_rules, FILTER_RULE_COUNT, FILTER_DEFAULT,
-                                 &hdr, &rule_idx);
-      }
-      else
-      {
-        /* Shorter than an Ethernet header: nothing to filter on. */
-        hdr.valid = 0u;
-        action    = PKT_DROP;
-        rule_idx  = -1;
-      }
-
-      /* 3. Count. */
-      if (rule_idx >= 0)
-      {
-        rule_hits[rule_idx]++;
-      }
-      else
-      {
-        default_hits++;
-      }
-
-      if (action == PKT_PASS)
-      {
-        frames_passed++;
-      }
-      else
-      {
-        frames_dropped++;
-      }
-
-      log_frame(pkt.len, &hdr, action, rule_idx);
+      log_frame(pkt.len, &hdr, v);
 
       /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
@@ -384,7 +348,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /** Print one line per frame: what it is and what the filter decided. */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_action_t action, int32_t rule_idx)
+static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
 {
   printf("RX %4u  ", (unsigned)len);
 
@@ -411,27 +375,39 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_action_t action, i
     printf("too short");
   }
 
-  if (rule_idx >= 0)
+  const char *verdict = (v.action == PKT_PASS) ? "PASS" : "DROP";
+
+  if (v.rule_idx >= 0)
   {
-    printf("  => %s (rule %ld)\r\n", (action == PKT_PASS) ? "PASS" : "DROP", (long)rule_idx);
+    printf("  => %s (rule %ld)\r\n", verdict, (long)v.rule_idx);
+  }
+  else if (v.reason == DROP_REASON_MALFORMED)
+  {
+    printf("  => %s (malformed)\r\n", verdict);
   }
   else
   {
-    printf("  => %s (default)\r\n", (action == PKT_PASS) ? "PASS" : "DROP");
+    printf("  => %s (default)\r\n", verdict);
   }
 }
 
-/** Print the filter counters. */
+/** Print the filter counters: totals, drops per reason, hits per rule. */
 static void print_stats(void)
 {
-  printf("--- passed %lu  dropped %lu  |", (unsigned long)frames_passed, (unsigned long)frames_dropped);
+  printf("--- passed %lu | dropped:", (unsigned long)filter.passed);
 
-  for (uint32_t i = 0u; i < FILTER_RULE_COUNT; i++)
+  for (uint32_t r = DROP_REASON_NONE + 1u; r < DROP_REASON_COUNT; r++)
   {
-    printf("  r%lu:%lu", (unsigned long)i, (unsigned long)rule_hits[i]);
+    printf(" %s %lu", pkt_drop_reason_name((pkt_drop_reason_t)r), (unsigned long)filter.dropped[r]);
   }
 
-  printf("  default:%lu ---\r\n", (unsigned long)default_hits);
+  printf(" | hits:");
+  for (uint32_t i = 0u; i < filter.rule_count; i++)
+  {
+    printf(" r%lu:%lu", (unsigned long)i, (unsigned long)filter.rule_hits[i]);
+  }
+
+  printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
 }
 /* USER CODE END 4 */
 

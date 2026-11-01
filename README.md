@@ -78,14 +78,25 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 - Pure C, no HAL: the same file is compiled for the board and for host tests.
 
 **Rule filter (`pkt_filter.c`)**
+- `pkt_filter_process()` is the whole per-frame pipeline: parse, drop
+  malformed frames before any rule sees them, then run the rule table.
+  It returns a verdict (`action`, drop `reason`, matching `rule_idx`).
+- A frame is malformed when a layer it claims to have is broken (EtherType
+  says IPv4 but the header is invalid, protocol says TCP/UDP but the header is
+  truncated). An absent layer is not an error (ARP, ICMP, later fragments).
 - Ordered rule table, first match wins, default action if nothing matches
   (like a firewall rule list).
 - A rule compares only the fields named in its `match` bits: EtherType,
   IP protocol, source/destination IP under a mask (subnets), ports.
 - A rule that asks about a layer the frame does not have never matches, so a
   port rule cannot hit an ARP frame through stale fields.
-- The rule table is `const`; per-rule hit counters, pass/drop totals and the
-  default-action count are kept by the caller and printed every 5 s.
+- The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
+  statistics: per-rule hits, default hits, passed frames and drops per reason
+  (`malformed`, `rule`, `default`). The main loop prints them every 5 s
+  (example numbers):
+  ```
+  --- passed 7 | dropped: malformed 0 rule 12 default 3 | hits: r0:12 r1:5 r2:2 default:3 ---
+  ```
 
 **HAL integration**
 - Uses the HAL ETH driver's buffer callbacks (`RxAllocateCallback`,
@@ -115,11 +126,11 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
-- **Host unit tests:** 29 tests (117 checks) build `pkt_parse.c` and
+- **Host unit tests:** 40 tests (167 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, IPv4 options, fragments,
-  first-match order, subnet masks, stale-field protection and the demo rule
-  table end to end. GitHub Actions runs them on every push with
+  first-match order, subnet masks, stale-field protection, the demo rule
+  table end to end, and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
 
 ## Running the unit tests
@@ -133,7 +144,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `117 checks, 0 failed: PASS`.
+Expected last line: `167 checks, 0 failed: PASS`.
 
 ## Build and flash
 

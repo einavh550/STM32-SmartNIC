@@ -95,4 +95,18 @@ bool pkt_parse_ipv4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
  */
 bool pkt_parse_l4(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
 
+/**
+ * @brief  Parse every layer the frame has: Ethernet, then IPv4, then TCP/UDP.
+ *
+ * A layer that is simply absent is fine (ARP has no IP header, ICMP has no
+ * ports, a non-first fragment has no L4 header). A layer the frame CLAIMS to
+ * have but that is broken makes the whole frame malformed: EtherType says IPv4
+ * but the IPv4 header is invalid, or the protocol says TCP/UDP but that header
+ * is truncated.
+ *
+ * @return true if the frame is well formed (out->valid says which layers were
+ *         found), false if it is malformed and should be dropped.
+ */
+bool pkt_parse_frame(const uint8_t *frame, uint16_t len, pkt_hdr_t *out);
+
 #endif /* INC_PKT_PARSE_H_ */
