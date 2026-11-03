@@ -197,6 +197,21 @@ RX frame: 110 bytes
   the board's own IP (LAND) and a group source MAC, plus an honest-looking
   10.0.0.99 from outside the link subnet. Counters: `spoofed +18` (6 x 3),
   `default +3` (ingress filtering), `passed +0`, exactly as expected.
+- **TCP scans (BBB):** `nic_test.py scan --count 3` sent NULL, FIN, XMAS
+  (FIN+PSH+URG), SYN+FIN and SYN+RST to port 80, plus plain ACKs as a control.
+  Two runs: `tcp-scan +30` (5 x 3 x 2), `passed +6` (`tcp:6`, the controls),
+  nothing else changed. Flags logged as `0x01`, `0x29`, `0x03`, `0x06` -> DROP,
+  `0x10` -> PASS.
+- **SYN flood (BBB):** `nic_test.py syn-flood --count 200` sent 200 SYNs to
+  port 80 in 5.4 s (37 frames/s) against the `tcp-new` bucket (20/s, burst 5).
+  Predicted `5 + 20 x 5.4 = 112` passed; the board counted `passed +113`,
+  `rate-limit +87`, `tcp-new +200` (off by one: the board's and the BBB's
+  clocks do not start at the same instant).
+- **Ping flood (BBB):** `nic_test.py ping-flood --count 200` sent 200 ICMP
+  frames in 5.6 s (35 frames/s) against the `ping` bucket (10/s, burst 5).
+  Predicted `5 + 10 x 5.6 = 61` passed / 139 rate-limited; the board counted
+  about 63 / 137 and `ping +200`. In the log, roughly one ping in 3.5 passes
+  (35 arriving per second, 10 tokens per second).
 - **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,

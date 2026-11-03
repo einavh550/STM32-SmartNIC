@@ -9,8 +9,9 @@ Usage (on the BBB, needs root for raw sockets):
 """
 
 import argparse
+import time
 
-from scapy.all import Ether, IP, TCP, UDP, Raw, sendp
+from scapy.all import Ether, ICMP, IP, TCP, UDP, Raw, sendp
 
 IFACE = "eth0"
 BOARD_MAC = "00:80:e1:00:00:00"   # main.c MX_ETH_Init MACAddr
@@ -84,10 +85,41 @@ def scenario_scan(count):
     print(f"expect: tcp-scan +{5 * count}, passed +{count} (hits tcp +{count})")
 
 
+FLOOD_INTER = 0.02   # 50 frames/s: a flood for the 20/s and 10/s limits, but
+                     # slow enough for the board's per-frame log line (~140/s).
+
+
+def flood(name, frame, count, rate_pps, burst, counter):
+    """Send count frames fast; print how many the token bucket should let pass."""
+    start = time.monotonic()
+    sendp(frame, iface=IFACE, count=count, inter=FLOOD_INTER, verbose=False)
+    seconds = time.monotonic() - start
+
+    allowed = min(count, burst + int(rate_pps * seconds))
+    print(f"{name}: sent {count} frames in {seconds:.1f} s "
+          f"({count / seconds:.0f} frames/s)")
+    print(f"bucket: starts with {burst} tokens, refills {rate_pps}/s")
+    print(f"expect: passed +{allowed} (about, +-2), rate-limit +{count - allowed}, "
+          f"hits {counter} +{count}")
+
+
+def scenario_syn_flood(count):
+    """SYN flood on the service port. Rule tcp-new: 20/s, burst 5."""
+    flood("syn-flood", tcp_to_service("S"), count, rate_pps=20, burst=5, counter="tcp-new")
+
+
+def scenario_ping_flood(count):
+    """Ping flood. Rule ping: 10/s, burst 5."""
+    frame = Ether(dst=BOARD_MAC) / IP(src=BBB_IP, dst=BOARD_IP) / ICMP()
+    flood("ping-flood", frame, count, rate_pps=10, burst=5, counter="ping")
+
+
 SCENARIOS = {
     "normal": scenario_normal,
     "spoof": scenario_spoof,
     "scan": scenario_scan,
+    "syn-flood": scenario_syn_flood,
+    "ping-flood": scenario_ping_flood,
 }
 
 
