@@ -10,13 +10,14 @@ Usage (on the BBB, needs root for raw sockets):
 
 import argparse
 
-from scapy.all import Ether, IP, UDP, Raw, sendp
+from scapy.all import Ether, IP, TCP, UDP, Raw, sendp
 
 IFACE = "eth0"
 BOARD_MAC = "00:80:e1:00:00:00"   # main.c MX_ETH_Init MACAddr
 BOARD_IP = "192.168.10.1"         # filter_policy.h POLICY_BOARD_IP
 BBB_IP = "192.168.10.2"
 UDP_TEST_PORT = 5000              # filter_policy.h POLICY_UDP_TEST_PORT
+TCP_PORT = 80                     # filter_policy.h POLICY_TCP_PORT
 
 
 def scenario_normal(count):
@@ -58,9 +59,35 @@ def scenario_spoof(count):
     print(f"expect: spoofed +{6 * count}, default +{count}, passed +0")
 
 
+def tcp_to_service(flags):
+    """TCP from the BBB to the protected service port, with the given flags."""
+    return (Ether(dst=BOARD_MAC)
+            / IP(src=BBB_IP, dst=BOARD_IP)
+            / TCP(sport=40001, dport=TCP_PORT, flags=flags))
+
+
+def scenario_scan(count):
+    """Port-scan flag combinations. Expect: tcp-scan += 5*count, tcp += count."""
+    frames = [
+        ("NULL scan (no flags)",       tcp_to_service("")),
+        ("FIN scan (FIN alone)",       tcp_to_service("F")),
+        ("XMAS scan (FIN+PSH+URG)",    tcp_to_service("FPU")),
+        ("SYN+FIN",                    tcp_to_service("SF")),
+        ("SYN+RST",                    tcp_to_service("SR")),
+        # Control: same port, same sender, honest flags. Must PASS, so the
+        # drops above are caused by the flags and nothing else.
+        ("control: plain ACK",         tcp_to_service("A")),
+    ]
+    for name, frame in frames:
+        sendp(frame, iface=IFACE, count=count, inter=0.1, verbose=False)
+        print(f"scan: sent {count} x {name}")
+    print(f"expect: tcp-scan +{5 * count}, passed +{count} (hits tcp +{count})")
+
+
 SCENARIOS = {
     "normal": scenario_normal,
     "spoof": scenario_spoof,
+    "scan": scenario_scan,
 }
 
 
