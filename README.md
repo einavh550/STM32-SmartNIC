@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | Planned  |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, first scenario verified |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -188,6 +188,10 @@ RX frame: 110 bytes
   (`0x0806`), DHCP Discover (`0.0.0.0 -> 255.255.255.255`, UDP 68 -> 67) and
   NetBIOS broadcasts (UDP 137). With a demo rule set (drop UDP:137, pass ARP,
   pass UDP:67, default drop) the per-rule counters matched the traffic seen.
+- **BBB link (Phase 4):** `nic_test.py normal --count 10` sent 10 UDP frames
+  to port 5000; the board logged 10 x `PASS (udp-test)` and the counters
+  went to `passed 10 | udp-test:10`. The BBB's own DHCP Discover
+  (`0.0.0.0 -> 255.255.255.255`, 68 -> 67) was dropped by the default rule.
 - **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,
@@ -200,6 +204,42 @@ RX frame: 110 bytes
   first-match order, subnet masks, stale-field protection,
   and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
+
+## BBB test link
+
+The BBB is controlled over USB SSH (`ssh debian@192.168.7.2`) while its
+Ethernet port is cabled directly to the board. Its
+`/etc/systemd/network/eth0.network`:
+
+```
+[Match]
+Name=eth0
+
+[Network]
+DHCP=ipv4
+Address=192.168.10.2/24
+
+[Neighbor]
+Address=192.168.10.1
+LinkLayerAddress=00:80:e1:00:00:00
+```
+
+- DHCP stays on so the same cable can go to a router for `apt install`;
+  on the board link only the static address is used.
+- The board has no TX path yet, so it never answers ARP. The static
+  neighbor entry gives the BBB the board's MAC up front; Scapy scenarios
+  send at layer 2 (`sendp`) and set the MAC themselves.
+
+Scenarios live in `tools/bbb/nic_test.py` (Scapy 2.5, `apt install
+python3-scapy`). Copy it over USB and run it on the BBB:
+
+```
+scp tools/bbb/nic_test.py debian@192.168.7.2:~     # on the PC
+sudo python3 nic_test.py normal --count 10         # on the BBB
+```
+
+Each scenario prints the counter change it expects, to compare with the
+board's stats line.
 
 ## Running the unit tests
 
@@ -238,6 +278,7 @@ Core/Inc, Core/Src
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
   filter_policy.[ch]     the rule table the board runs (BBB link)
   main.c                 init sequence, main loop, rule table and counters
+tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
 tests/                   host unit tests (parser, filter) + Makefile
 .github/workflows/       CI: runs the host tests on every push
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
@@ -266,3 +307,5 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   upstream.
 - Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is
   done by requiring the subnet in every allow rule.
+- The COM log loses characters (e.g. `passd`, `drppe`) under steady
+  traffic. Under investigation (per-frame printf load, 8 MHz clock).
