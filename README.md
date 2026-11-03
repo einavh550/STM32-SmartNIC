@@ -192,6 +192,11 @@ RX frame: 110 bytes
   to port 5000; the board logged 10 x `PASS (udp-test)` and the counters
   went to `passed 10 | udp-test:10`. The BBB's own DHCP Discover
   (`0.0.0.0 -> 255.255.255.255`, 68 -> 67) was dropped by the default rule.
+- **Spoofed sources (BBB):** `nic_test.py spoof --count 3` sent UDP to the open
+  test port from 127.0.0.1, 224.0.0.5, 255.255.255.255, 0.0.0.0 (not DHCP),
+  the board's own IP (LAND) and a group source MAC, plus an honest-looking
+  10.0.0.99 from outside the link subnet. Counters: `spoofed +18` (6 x 3),
+  `default +3` (ingress filtering), `passed +0`, exactly as expected.
 - **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,

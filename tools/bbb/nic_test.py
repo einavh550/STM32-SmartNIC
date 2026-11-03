@@ -30,8 +30,37 @@ def scenario_normal(count):
     print(f"expect: passed +{count}, udp-test +{count}")
 
 
+def udp_to_test_port(src_ip, dst_ip=BOARD_IP, src_mac=None):
+    """UDP to the test port: would PASS if the source were honest."""
+    eth = Ether(dst=BOARD_MAC) if src_mac is None else Ether(dst=BOARD_MAC, src=src_mac)
+    return (eth
+            / IP(src=src_ip, dst=dst_ip)
+            / UDP(sport=40000, dport=UDP_TEST_PORT)
+            / Raw(b"spoof"))
+
+
+def scenario_spoof(count):
+    """Lying source addresses. Expect: spoofed += 6*count, default += count."""
+    frames = [
+        ("loopback 127.0.0.1",        udp_to_test_port("127.0.0.1")),
+        ("multicast 224.0.0.5",       udp_to_test_port("224.0.0.5")),
+        ("broadcast 255.255.255.255", udp_to_test_port("255.255.255.255")),
+        ("0.0.0.0, not DHCP",         udp_to_test_port("0.0.0.0")),
+        ("LAND: src == dst",          udp_to_test_port(BOARD_IP)),
+        ("group source MAC",          udp_to_test_port(BBB_IP, src_mac="01:00:5e:00:00:01")),
+        # Not a lie the board can see: a normal-looking address, but outside
+        # the link subnet. The rules only allow 192.168.10.0/24 (ingress filtering).
+        ("outside subnet 10.0.0.99",  udp_to_test_port("10.0.0.99")),
+    ]
+    for name, frame in frames:
+        sendp(frame, iface=IFACE, count=count, inter=0.1, verbose=False)
+        print(f"spoof: sent {count} x {name}")
+    print(f"expect: spoofed +{6 * count}, default +{count}, passed +0")
+
+
 SCENARIOS = {
     "normal": scenario_normal,
+    "spoof": scenario_spoof,
 }
 
 
