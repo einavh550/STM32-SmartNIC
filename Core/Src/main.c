@@ -208,8 +208,10 @@ int main(void)
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
-      /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
-      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, HAL_GetTick(), &hdr);
+      /* Parse, drop if malformed or the MAC reported a checksum error, else
+       * run the rules. Counters are updated inside. */
+      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
+                                           HAL_GetTick(), &hdr);
 
       log_frame(&pkt, &hdr, v);
 
@@ -405,7 +407,7 @@ static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t
   }
   else
   {
-    /* malformed, spoofed, tcp-scan or default */
+    /* malformed, bad-checksum, spoofed, tcp-scan or default */
     printf("  => %s (%s)\r\n", verdict, pkt_drop_reason_name(v.reason));
   }
 }

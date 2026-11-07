@@ -90,7 +90,12 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 - `pkt_filter_process()` is the whole per-frame pipeline. Each stage either
   decides or hands the frame to the next one; the fixed checks run before the
   rule table, so no rule can let a bad frame through:
-  1. **sanity**: malformed frames are dropped;
+  1. **sanity**: malformed frames are dropped; then frames whose headers look
+     valid but whose MAC checksum offload report says the bytes are corrupted
+     (`bad-checksum`, see Checksum offload). A frame that is both broken and
+     flagged counts as `malformed`: the parser's answer is more precise and
+     does not depend on the hardware. Corrupted frames are dropped before
+     anti-spoofing, because their addresses may be the corrupted part;
   2. **anti-spoofing**: source addresses no honest sender can have
      ("martians", RFC 1812 / RFC 5735) are dropped: a multicast/broadcast
      source MAC, a loopback (127/8), multicast, reserved or broadcast source
@@ -133,10 +138,10 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
     also uses up the share of honest senders (see limitations).
 - The rule table is `const`. The filter instance (`pkt_filter_t`) keeps the
   statistics: per-rule hits, default hits, passed frames and drops per reason
-  (`malformed`, `spoofed`, `tcp-scan`, `rate-limit`, `rule`, `default`). The
+  (`malformed`, `bad-checksum`, `spoofed`, `tcp-scan`, `rate-limit`, `rule`, `default`). The
   main loop prints them every 5 s (example numbers):
   ```
-  --- passed 7 | dropped: malformed 0 spoofed 0 tcp-scan 0 rate-limit 0 rule 0 default 14 | hits: arp:7 ping:0 tcp-new:0 tcp:0 udp-test:0 default:14 ---
+  --- passed 7 | dropped: malformed 0 bad-checksum 0 spoofed 0 tcp-scan 0 rate-limit 0 rule 0 default 14 | hits: arp:7 ping:0 tcp-new:0 tcp:0 udp-test:0 default:14 ---
   ```
 
 **Filter policy (`filter_policy.c`)**
@@ -179,11 +184,12 @@ tests check exactly this table. Default deny: anything not listed is dropped.
   only the buffer address. `eth_rx.c` finds the descriptor that owns the buffer
   (`BackupAddr0`, 4 descriptors), checks `RS1V` (DESC1 valid) and translates
   `IPHE` / `IPCE` into `PKT_FLAG_IP_HDR_ERR` / `PKT_FLAG_IP_PAYLOAD_ERR` in
-  `pkt_desc_t.flags`, our own bits, so the code that reads them does not
+  `pkt_desc_t.flags` (`pkt_flags.h`), our own bits, so the code that reads them does not
   depend on the descriptor layout. This happens inside `HAL_ETH_ReadData()`,
   before the HAL rebuilds the descriptor; the descriptors are in non-cacheable
   D2 SRAM, so no cache maintenance is needed.
-- The RX log shows the report as `[hw: ip-hdr]` / `[hw: payload]`.
+- The RX log shows the report as `[hw: ip-hdr]` / `[hw: payload]`, and the
+  filter drops such frames as `bad-checksum` (see Rule filter).
 
 ## Verification
 
@@ -250,7 +256,7 @@ RX frame: 110 bytes
   bytes and ignores the data offset; only the parser catches them); both
   fragments -> no report (the hardware does not checksum fragments; only the
   RFC 1858 checks catch them). Hardware and parser check different things.
-- **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
+- **Host unit tests:** 82 tests (401 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,
   Ethernet padding, IPv4 and TCP options, fragments and RFC 1858 fragment
@@ -259,7 +265,9 @@ RX frame: 110 bytes
   group source MAC), the token bucket (burst, refill, cap, tick wrap,
   overflow, SYN flood), the shipped policy (BBB traffic, SYN / ping / ARP
   floods, ingress filtering, unlisted services),
-  first-match order, subnet masks, stale-field protection,
+  first-match order, subnet masks, stale-field protection, the MAC's
+  checksum report (drops a valid-looking frame, loses to `malformed`, runs
+  before anti-spoofing and scan detection),
   and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
 
@@ -310,7 +318,7 @@ make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
 ```
 
-Expected last line: `380 checks, 0 failed: PASS`.
+Expected last line: `401 checks, 0 failed: PASS`.
 
 ## Build and flash
 
@@ -331,7 +339,8 @@ hand-written code stays inside `USER CODE` blocks or in separate files.
 Core/Inc, Core/Src
   ring_buffer.[ch]       SPSC ring buffer
   ring_buffer_test.[ch]  on-target self-test
-  eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue
+  eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
+  pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
   pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
   filter_policy.[ch]     the rule table the board runs (BBB link)

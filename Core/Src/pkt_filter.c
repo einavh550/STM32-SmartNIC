@@ -212,14 +212,25 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
 /* The pipeline: each stage either decides (return) or hands over to the next.
  * Cheap, always-on checks come first, so no rule can let a bad frame through. */
 static pkt_verdict_t decide(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                            uint32_t now_ms, pkt_hdr_t *hdr)
+                            uint16_t hw_flags, uint32_t now_ms, pkt_hdr_t *hdr)
 {
     pkt_verdict_t v = { .action = PKT_DROP, .reason = DROP_REASON_MALFORMED, .rule_idx = -1 };
 
-    /* Stage 1: sanity. */
+    /* Stage 1: sanity. The parser first: when it finds the frame broken,
+     * that is the more precise answer, and it does not depend on hardware. */
     if (!pkt_parse_frame(frame, len, hdr))
     {
         return v;                                 /* DROP, malformed */
+    }
+
+    /* Headers look fine, but the MAC's checksum offload says the bytes are
+     * not what the sender wrote (bit flip, or a crafted frame). Every field
+     * may be the corrupted one, so no later stage can trust them (RFC 1122:
+     * silently discard; here: discard and count). */
+    if ((hw_flags & PKT_FLAG_CSUM_ERRORS) != 0u)
+    {
+        v.reason = DROP_REASON_BAD_CHECKSUM;
+        return v;                                 /* DROP, bad-checksum */
     }
 
     /* Stage 2: anti-spoofing. */
@@ -266,9 +277,9 @@ static pkt_verdict_t decide(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
 }
 
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                                 uint32_t now_ms, pkt_hdr_t *hdr)
+                                 uint16_t hw_flags, uint32_t now_ms, pkt_hdr_t *hdr)
 {
-    const pkt_verdict_t v = decide(f, frame, len, now_ms, hdr);
+    const pkt_verdict_t v = decide(f, frame, len, hw_flags, now_ms, hdr);
 
     /* Rule statistics: only frames that reached the rule table. */
     if (v.rule_idx >= 0)
@@ -299,6 +310,7 @@ const char *pkt_drop_reason_name(pkt_drop_reason_t reason)
     {
         case DROP_REASON_NONE:      return "none";
         case DROP_REASON_MALFORMED: return "malformed";
+        case DROP_REASON_BAD_CHECKSUM: return "bad-checksum";
         case DROP_REASON_SPOOFED:   return "spoofed";
         case DROP_REASON_TCP_SCAN:  return "tcp-scan";
         case DROP_REASON_RATE_LIMIT: return "rate-limit";
