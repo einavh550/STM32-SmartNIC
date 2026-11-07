@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, first scenario verified |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed scenarios verified |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -212,6 +212,17 @@ RX frame: 110 bytes
   Predicted `5 + 10 x 5.6 = 61` passed / 139 rate-limited; the board counted
   about 63 / 137 and `ping +200`. In the log, roughly one ping in 3.5 passes
   (35 arriving per second, 10 tokens per second).
+- **Malformed headers (BBB):** `nic_test.py malformed --count 3` sent 9 kinds
+  of lying headers (IPv4 version 6, IHL 4, total length 10 and 1000, UDP
+  header cut by the total length, TCP data offset 4 and 15, RFC 1858 tiny and
+  overlapping fragments) plus an honest UDP control frame. With the HAL
+  default MAC settings the board counted only `malformed +12` (the 4 TCP
+  kinds) and `passed +3`: the 15 frames with a broken IPv4 header were never
+  seen by the firmware and appeared in no counter. Cause: the MAC's checksum
+  offload engine flags them and the MTL drops them in hardware, before the DMA
+  (`DropTCPIPChecksumErrorPacket = ENABLE`). With that drop disabled, the same
+  run gave `malformed +27`, `passed +3`, as predicted. The PC test harness
+  checked beforehand that `pkt_parse.c` rejects all 9 frames, padded to 60 bytes.
 - **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,

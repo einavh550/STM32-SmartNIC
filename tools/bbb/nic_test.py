@@ -85,7 +85,47 @@ def scenario_scan(count):
     print(f"expect: tcp-scan +{5 * count}, passed +{count} (hits tcp +{count})")
 
 
-FLOOD_INTER = 0.02   # 50 frames/s: a flood for the 20/s and 10/s limits, but
+def ip_to_board(**ip_fields):
+    """Ethernet + IPv4 from the BBB to the board. ip_fields overwrite header
+    fields Scapy would otherwise compute itself (len, ihl, version, frag...)."""
+    return Ether(dst=BOARD_MAC) / IP(src=BBB_IP, dst=BOARD_IP, **ip_fields)
+
+
+def scenario_malformed(count):
+    """Headers that lie about themselves. Expect: malformed += 9*count, passed += count.
+
+    Every frame comes from the honest BBB address to an open port, so the only
+    reason to drop it is the broken header (stage 1, sanity). Note: the BBB pads
+    short frames to 60 bytes, so "too long" lies must exceed 60 - 14 = 46 bytes.
+    """
+    udp = UDP(sport=40000, dport=UDP_TEST_PORT) / Raw(b"malformed")
+    frames = [
+        # IPv4 header
+        ("IP version 6 inside an IPv4 frame",  ip_to_board(version=6) / udp),
+        ("IHL 4 (header shorter than 20 B)",   ip_to_board(ihl=4) / udp),
+        ("total length 10 (< header)",         ip_to_board(len=10) / udp),
+        ("total length 1000 (> frame)",        ip_to_board(len=1000) / udp),
+        # TCP/UDP header must fit inside the IP packet
+        ("UDP header cut: total length 24",    ip_to_board(len=24) / udp),
+        ("TCP data offset 4 (< 20 B)",
+         ip_to_board() / TCP(sport=40001, dport=TCP_PORT, flags="A", dataofs=4)),
+        ("TCP data offset 15 (past the end)",
+         ip_to_board() / TCP(sport=40001, dport=TCP_PORT, flags="A", dataofs=15)),
+        # RFC 1858 fragment attacks
+        ("tiny fragment: 8 B of TCP header",
+         ip_to_board(proto=6, flags="MF", frag=0) / Raw(bytes(TCP(dport=TCP_PORT))[:8])),
+        ("overlapping fragment at offset 1",
+         ip_to_board(proto=6, frag=1) / Raw(b"\x00" * 16)),
+        # Control: the same sender and port, header honest. Must PASS.
+        ("control: honest UDP",                ip_to_board() / udp),
+    ]
+    for name, frame in frames:
+        sendp(frame, iface=IFACE, count=count, inter=0.1, verbose=False)
+        print(f"malformed: sent {count} x {name}")
+    print(f"expect: malformed +{9 * count}, passed +{count} (hits udp-test +{count})")
+
+
+FLOOD_INTER = 0.02  # 50 frames/s: a flood for the 20/s and 10/s limits, but
                      # slow enough for the board's per-frame log line (~140/s).
 
 
@@ -118,6 +158,7 @@ SCENARIOS = {
     "normal": scenario_normal,
     "spoof": scenario_spoof,
     "scan": scenario_scan,
+    "malformed": scenario_malformed,
     "syn-flood": scenario_syn_flood,
     "ping-flood": scenario_ping_flood,
 }
