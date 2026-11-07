@@ -79,7 +79,7 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v);
+static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v);
 static void print_stats(void);
 /* USER CODE END PFP */
 
@@ -169,6 +169,24 @@ int main(void)
     Error_Handler();
   }
 
+  /* Checksum offload: the MAC checks every IPv4 header and TCP/UDP checksum
+   * in hardware and reports the result in the RX descriptor. The HAL default
+   * (DropTCPIPChecksumErrorPacket = ENABLE) also DROPS the failing frames
+   * inside the MAC, before the DMA, without any counter: the firmware never
+   * learns they existed. Forward them instead; eth_rx.c passes the MAC's
+   * report on with each frame and the filter drops and counts them as
+   * "bad-checksum". The MAC config can only change before HAL_ETH_Start_IT(). */
+  {
+    ETH_MACConfigTypeDef mac_cfg;
+    HAL_ETH_GetMACConfig(&heth, &mac_cfg);
+    mac_cfg.DropTCPIPChecksumErrorPacket = DISABLE;
+    if (HAL_ETH_SetMACConfig(&heth, &mac_cfg) != HAL_OK)
+    {
+      printf("ETH MAC config failed\r\n");
+      Error_Handler();
+    }
+  }
+
   eth_rx_init();
   if (HAL_ETH_Start_IT(&heth) != HAL_OK)
   {
@@ -193,7 +211,7 @@ int main(void)
       /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
       pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, HAL_GetTick(), &hdr);
 
-      log_frame(pkt.len, &hdr, v);
+      log_frame(&pkt, &hdr, v);
 
       /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
@@ -331,9 +349,9 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /** Print one line per frame: what it is and what the filter decided. */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
+static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v)
 {
-  printf("RX %4u  ", (unsigned)len);
+  printf("RX %4u  ", (unsigned)pkt->len);
 
   if ((hdr->valid & PKT_HAS_IPV4) != 0u)
   {
@@ -361,6 +379,16 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
   else
   {
     printf("too short");
+  }
+
+  /* The MAC's checksum offload report (eth_rx.c), if it found an error. */
+  if ((pkt->flags & PKT_FLAG_IP_HDR_ERR) != 0u)
+  {
+    printf("  [hw: ip-hdr]");
+  }
+  if ((pkt->flags & PKT_FLAG_IP_PAYLOAD_ERR) != 0u)
+  {
+    printf("  [hw: payload]");
   }
 
   const char *verdict = (v.action == PKT_PASS) ? "PASS" : "DROP";

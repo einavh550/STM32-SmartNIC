@@ -166,6 +166,25 @@ tests check exactly this table. Default deny: anything not listed is dropped.
 - `HAL_ETH_RxCpltCallback` drains every completed descriptor with
   `HAL_ETH_ReadData()` in a loop, so a burst of frames is handled in one interrupt.
 
+**Checksum offload (MAC hardware)**
+- The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
+  the frame arrives, at no CPU cost, and writes the result into the RX
+  descriptor (DESC1: `IPHE` IP header error, `IPCE` IP payload error).
+- The HAL default (`DropTCPIPChecksumErrorPacket = ENABLE`) also drops the
+  failing frames inside the MAC, before the DMA, with no counter: the firmware
+  never learns they existed (found with the `malformed` scenario, see
+  Verification). `main.c` disables that drop, so every frame reaches the
+  firmware and every drop is counted.
+- The HAL keeps only DESC3 of a finished descriptor and the link callback gets
+  only the buffer address. `eth_rx.c` finds the descriptor that owns the buffer
+  (`BackupAddr0`, 4 descriptors), checks `RS1V` (DESC1 valid) and translates
+  `IPHE` / `IPCE` into `PKT_FLAG_IP_HDR_ERR` / `PKT_FLAG_IP_PAYLOAD_ERR` in
+  `pkt_desc_t.flags`, our own bits, so the code that reads them does not
+  depend on the descriptor layout. This happens inside `HAL_ETH_ReadData()`,
+  before the HAL rebuilds the descriptor; the descriptors are in non-cacheable
+  D2 SRAM, so no cache maintenance is needed.
+- The RX log shows the report as `[hw: ip-hdr]` / `[hw: payload]`.
+
 ## Verification
 
 - **Ring buffer:** on-target self-test (`ring_buffer_test.c`, enabled with
@@ -223,6 +242,14 @@ RX frame: 110 bytes
   (`DropTCPIPChecksumErrorPacket = ENABLE`). With that drop disabled, the same
   run gave `malformed +27`, `passed +3`, as predicted. The PC test harness
   checked beforehand that `pkt_parse.c` rejects all 9 frames, padded to 60 bytes.
+  With the MAC's report shown in the log (`--count 1`, `malformed +9`,
+  `passed +1`): version 6 and IHL 4 -> `[hw: ip-hdr]`; total length 10, 1000
+  and the cut UDP header -> `[hw: payload]` (the hardware counts a total length
+  that disagrees with the received bytes as a payload error, not a header
+  error); TCP data offset 4 and 15 -> no report (the hardware checksums all the
+  bytes and ignores the data offset; only the parser catches them); both
+  fragments -> no report (the hardware does not checksum fragments; only the
+  RFC 1858 checks catch them). Hardware and parser check different things.
 - **Host unit tests:** 79 tests (380 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,

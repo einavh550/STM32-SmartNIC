@@ -46,8 +46,15 @@ typedef struct
 {
     uint8_t  *data;   /**< Start of the frame in a DMA-capable RX buffer.         */
     uint16_t  len;    /**< Frame length in bytes (max 1518 fits in 16 bits).      */
-    uint16_t  flags;  /**< Status bits from the ETH DMA (e.g. CRC error), Phase 2. */
+    uint16_t  flags;  /**< PKT_FLAG_* status bits reported by the ETH MAC/DMA.    */
 } pkt_desc_t;
+
+/* pkt_desc_t.flags: the MAC's checksum offload report for this frame.
+ * Our own bit values, not the hardware's: code that reads them (main loop,
+ * filter, host tests) does not depend on the STM32 descriptor layout. */
+#define PKT_FLAG_IP_HDR_ERR     (1u << 0)  /**< IPv4 header checksum/version/length wrong. */
+#define PKT_FLAG_IP_PAYLOAD_ERR (1u << 1)  /**< TCP/UDP/ICMP checksum wrong, or the IP total
+                                               length disagrees with the bytes received. */
 
 /**
  * @brief SPSC ring of packet descriptors.
