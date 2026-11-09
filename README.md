@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed scenarios verified |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -256,6 +256,15 @@ RX frame: 110 bytes
   bytes and ignores the data offset; only the parser catches them); both
   fragments -> no report (the hardware does not checksum fragments; only the
   RFC 1858 checks catch them). Hardware and parser check different things.
+- **Checksum errors (BBB):** the `malformed` scenario also sends two frames
+  whose headers are correct but whose checksums are wrong: IP header checksum
+  `0xDEAD` (correct value `0xE573`) and UDP checksum `0xBEEF` (correct value
+  `0xA00F`). The parser accepts both, so only the MAC can catch them.
+  `--count 1` gave `malformed +9`, `bad-checksum +2`, `passed +1`, as expected.
+  Log: `p17 40000->5000 [hw: ip-hdr] => DROP (bad-checksum)` and
+  `p17 40000->5000 [hw: payload] => DROP (bad-checksum)`. The bad-checksum
+  path works end to end, from the RX descriptor's status bits through the ISR
+  and the main loop to the filter.
 - **Host unit tests:** 82 tests (401 checks) build `pkt_parse.c` and
   `pkt_filter.c` for the PC and feed them hand-built frames: valid ARP / UDP /
   TCP, byte order, truncated and malformed headers, lying IP total length,

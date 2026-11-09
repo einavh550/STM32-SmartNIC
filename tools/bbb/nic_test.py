@@ -92,7 +92,8 @@ def ip_to_board(**ip_fields):
 
 
 def scenario_malformed(count):
-    """Headers that lie about themselves. Expect: malformed += 9*count, passed += count.
+    """Headers that lie about themselves. Expect: malformed += 9*count,
+    bad-checksum += 2*count, passed += count.
 
     Every frame comes from the honest BBB address to an open port, so the only
     reason to drop it is the broken header (stage 1, sanity). Note: the BBB pads
@@ -116,13 +117,20 @@ def scenario_malformed(count):
          ip_to_board(proto=6, flags="MF", frag=0) / Raw(bytes(TCP(dport=TCP_PORT))[:8])),
         ("overlapping fragment at offset 1",
          ip_to_board(proto=6, frag=1) / Raw(b"\x00" * 16)),
+        # Wrong checksums: the headers are fine, so the parser accepts them.
+        # Only the MAC hardware catches these -> bad-checksum, not malformed.
+        ("wrong IP header checksum",           ip_to_board(chksum=0xDEAD) / udp),
+        ("wrong UDP checksum",
+         ip_to_board() / UDP(sport=40000, dport=UDP_TEST_PORT, chksum=0xBEEF)
+         / Raw(b"malformed")),
         # Control: the same sender and port, header honest. Must PASS.
         ("control: honest UDP",                ip_to_board() / udp),
     ]
     for name, frame in frames:
         sendp(frame, iface=IFACE, count=count, inter=0.1, verbose=False)
         print(f"malformed: sent {count} x {name}")
-    print(f"expect: malformed +{9 * count}, passed +{count} (hits udp-test +{count})")
+    print(f"expect: malformed +{9 * count}, bad-checksum +{2 * count}, "
+          f"passed +{count} (hits udp-test +{count})")
 
 
 FLOOD_INTER = 0.02  # 50 frames/s: a flood for the 20/s and 10/s limits, but
