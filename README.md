@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL) |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -170,6 +170,16 @@ tests check exactly this table. Default deny: anything not listed is dropped.
   `RxLinkCallback`) so the driver works directly on the pool buffers.
 - `HAL_ETH_RxCpltCallback` drains every completed descriptor with
   `HAL_ETH_ReadData()` in a loop, so a burst of frames is handled in one interrupt.
+
+**Clock tree (CubeMX)**
+- 8 MHz HSE → PLL1 (÷4 = 2 MHz input, ×275, ÷1) → **550 MHz** SYSCLK / CPU,
+  the maximum for the STM32H723.
+- AXI / AHB (ETH DMA, SRAM) 275 MHz, APB1-4 137.5 MHz: each at its limit.
+- Needs core voltage scale 0 and 3 flash wait states (`FLASH_LATENCY_3`):
+  flash cannot deliver an instruction every cycle at this speed.
+- UART baud rate and the 1 ms SysTick are recomputed by the HAL from the new
+  clocks. The boot log prints `CPU clock: 550 MHz`, read back from the RCC
+  registers.
 
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
@@ -365,11 +375,7 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 
 - If all 16 buffers are in use, the DMA stops with "RX buffer unavailable" and is
   not yet restarted automatically when buffers are freed.
-- The core runs directly from the 8 MHz HSE clock; PLL configuration to full
-  speed is planned for the profiling phase.
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
-- The `flags` field of the packet descriptor is not filled yet (no per-frame
-  error reporting).
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.
 - The filter is stateless (no connection tracking): ACK / FIN+ACK scans look
@@ -383,5 +389,6 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   upstream.
 - Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is
   done by requiring the subnet in every allow rule.
-- The COM log loses characters (e.g. `passd`, `drppe`) under steady
-  traffic. Under investigation (per-frame printf load, 8 MHz clock).
+- Every frame is logged with `printf` at 115200 baud (~140 lines/s), which
+  limits how fast frames can be processed; a switch to turn the per-frame log
+  off is planned before throughput measurements.
