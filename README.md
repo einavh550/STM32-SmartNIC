@@ -1,6 +1,6 @@
 # STM32-SmartNIC
 
-[![host-tests](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml)
+[![ci](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/ci.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/ci.yml)
 
 Bare-metal firmware that turns an STM32H723 into a simple SmartNIC: it receives
 Ethernet frames through the MAC's DMA, hands them from the interrupt to the main
@@ -342,6 +342,31 @@ hand-written code stays inside `USER CODE` blocks or in separate files.
    ```
 3. Open the ST-LINK virtual COM port at 115200 baud to see the log.
 
+### Command-line build (used by CI)
+
+`firmware.mk` builds the same `.elf` without the IDE, with the CubeIDE
+`Debug` compiler flags plus `-Werror`. CubeIDE's own generated makefile lives
+in `Debug/`, which is not in git, so CI uses this one. Both builds give
+identical section sizes.
+
+```
+make -f firmware.mk        # -> build/fw/STM32-SmartNIC.elf (Windows: mingw32-make)
+```
+
+Needs `arm-none-eabi-gcc` in `PATH` (Ubuntu: `apt install gcc-arm-none-eabi
+libnewlib-arm-none-eabi`; or the one inside STM32CubeIDE's
+`plugins/*gnu-tools-for-stm32*/tools/bin`).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, one job per
+check:
+
+| Job | What it checks |
+|---|---|
+| Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
+| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
+
 ## Project layout
 
 ```
@@ -356,7 +381,8 @@ Core/Inc, Core/Src
   main.c                 init sequence, main loop, rule table and counters
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
 tests/                   host unit tests (parser, filter) + Makefile
-.github/workflows/       CI: runs the host tests on every push
+.github/workflows/ci.yml CI: host tests + firmware build on every push
+firmware.mk              command-line firmware build (same flags as CubeIDE)
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
 STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 ```

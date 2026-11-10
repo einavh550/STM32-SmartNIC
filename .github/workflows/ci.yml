@@ -1,0 +1,39 @@
+name: ci
+
+# Every push and pull request runs all checks, each as its own job.
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    name: Host unit tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run tests (with AddressSanitizer + UBSan)
+        run: make -C tests SAN=1
+
+  firmware-build:
+    name: Firmware build (arm-none-eabi, -Werror)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the ARM GCC toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version
+
+      - name: Build the firmware
+        run: make -f firmware.mk -j"$(nproc)"
+
+      - name: Keep the .elf and .map as a download
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/fw/STM32-SmartNIC.elf
+            build/fw/STM32-SmartNIC.map

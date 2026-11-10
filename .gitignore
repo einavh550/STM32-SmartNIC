@@ -24,3 +24,6 @@ $RECYCLE.BIN/
 
 # Python bytecode cache
 __pycache__/
+
+# Command-line firmware build output (firmware.mk)
+/build/
