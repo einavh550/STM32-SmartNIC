@@ -37,6 +37,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
+#define BUTTON_DEBOUNCE_MS (200u)   /* ignore button bounces closer than this */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,6 +72,13 @@ ETH_HandleTypeDef heth;
 /* USER CODE BEGIN PV */
 /* Rule table (filter_policy.c) + counters. Used only by the main loop. */
 static pkt_filter_t filter;
+
+/* Per-frame log switch. printf at 115200 costs ~7 ms per line, far more than
+ * the filter itself, so it must be off when measuring. The USER button toggles
+ * it at runtime; the stats line every STATS_PERIOD_MS is always printed.
+ * The ISR only raises a flag; the main loop does the toggle and the printing. */
+static volatile uint8_t button_pressed;   /* set by the button ISR, cleared by main */
+static uint8_t log_frames = 1u;           /* 1 = print one line per frame (yellow LED on) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,6 +89,7 @@ static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
 static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v);
 static void print_stats(void);
+static void handle_button(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -196,6 +205,8 @@ int main(void)
   printf("ETH RX started\r\n");
   /* Read back from the RCC registers: proves the PLL really runs (550 MHz). */
   printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
+  printf("Per-frame log ON (USER button toggles)\r\n");
+  BSP_LED_On(LED_YELLOW);
 
   while (1)
   {
@@ -215,11 +226,16 @@ int main(void)
       pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
                                            HAL_GetTick(), &hdr);
 
-      log_frame(&pkt, &hdr, v);
+      if (log_frames != 0u)
+      {
+        log_frame(&pkt, &hdr, v);
+      }
 
       /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
     }
+
+    handle_button();
 
     /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
     if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
@@ -361,6 +377,45 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/** USER button ISR (overrides the weak BSP version). Keep it tiny: just a flag. */
+void BSP_PB_Callback(Button_TypeDef Button)
+{
+  if (Button == BUTTON_USER)
+  {
+    button_pressed = 1u;
+  }
+}
+
+/** Main-loop side of the button: debounce, flip the log switch, report it. */
+static void handle_button(void)
+{
+  static uint32_t last_press_ms;
+
+  if (button_pressed == 0u)
+  {
+    return;
+  }
+  button_pressed = 0u;
+
+  /* A mechanical button bounces: one press can fire several interrupts. */
+  if ((HAL_GetTick() - last_press_ms) < BUTTON_DEBOUNCE_MS)
+  {
+    return;
+  }
+  last_press_ms = HAL_GetTick();
+
+  log_frames ^= 1u;
+  if (log_frames != 0u)
+  {
+    BSP_LED_On(LED_YELLOW);
+  }
+  else
+  {
+    BSP_LED_Off(LED_YELLOW);
+  }
+  printf("Per-frame log %s\r\n", (log_frames != 0u) ? "ON" : "OFF");
+}
+
 /** Print one line per frame: what it is and what the filter decided. */
 static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v)
 {

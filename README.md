@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL) |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button) |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -180,6 +180,18 @@ tests check exactly this table. Default deny: anything not listed is dropped.
 - UART baud rate and the 1 ms SysTick are recomputed by the HAL from the new
   clocks. The boot log prints `CPU clock: 550 MHz`, read back from the RCC
   registers.
+
+**Per-frame log switch (USER button)**
+- One log line at 115200 baud takes ~7 ms, thousands of times longer than
+  filtering the frame, so with the log on any timing would measure the UART,
+  not the filter.
+- The blue USER button toggles the per-frame log at runtime (no reflash).
+  The yellow LED is on while the log is on; the board prints
+  `Per-frame log ON` / `OFF`. It starts ON. The stats line every 5 s is always
+  printed.
+- The button interrupt (`BSP_PB_Callback`) only sets a flag; the main loop
+  flips the switch and prints, so no `printf` runs inside an ISR. Presses
+  closer than 200 ms are ignored (contact bounce).
 
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
@@ -351,6 +363,7 @@ hand-written code stays inside `USER CODE` blocks or in separate files.
    STM32_Programmer_CLI -c port=SWD mode=UR -w Debug/STM32-SmartNIC.elf -v -hardRst
    ```
 3. Open the ST-LINK virtual COM port at 115200 baud to see the log.
+   Press the blue USER button to turn the per-frame log off / on (yellow LED).
 
 ## Project layout
 
@@ -389,6 +402,6 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   upstream.
 - Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is
   done by requiring the subnet in every allow rule.
-- Every frame is logged with `printf` at 115200 baud (~140 lines/s), which
-  limits how fast frames can be processed; a switch to turn the per-frame log
-  off is planned before throughput measurements.
+- With the per-frame log on, `printf` at 115200 baud (~140 lines/s) limits how
+  fast frames can be processed; turn it off with the USER button for
+  throughput tests.
