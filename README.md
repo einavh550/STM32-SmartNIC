@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button) |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -192,6 +192,17 @@ tests check exactly this table. Default deny: anything not listed is dropped.
 - The button interrupt (`BSP_PB_Callback`) only sets a flag; the main loop
   flips the switch and prints, so no `printf` runs inside an ISR. Presses
   closer than 200 ms are ignored (contact bounce).
+
+**Cycle measurement (DWT)**
+- The Cortex-M7 DWT unit has a 32-bit counter, `CYCCNT`, that counts CPU
+  clock cycles (1 cycle = 1.82 ns at 550 MHz). `perf.[ch]` starts it at boot
+  and reads it before and after `pkt_filter_process()` (parse + all filter
+  stages) for every frame.
+- The cost of the two reads themselves is measured at boot and subtracted.
+- Every 5 s the stats show min / avg / max cycles per frame for that period
+  (and avg in ns), then the numbers restart.
+- `max` can include an Ethernet interrupt that arrived during the
+  measurement; `min` and `avg` are the filter's own cost.
 
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
@@ -373,6 +384,7 @@ Core/Inc, Core/Src
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
+  perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max
   pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
   filter_policy.[ch]     the rule table the board runs (BBB link)
@@ -405,3 +417,5 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - With the per-frame log on, `printf` at 115200 baud (~140 lines/s) limits how
   fast frames can be processed; turn it off with the USER button for
   throughput tests.
+- Cycle numbers come from the Debug build (`-O0`, no optimisation); an
+  optimised build will be faster.

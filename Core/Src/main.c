@@ -27,6 +27,7 @@
 #include "pkt_parse.h"
 #include "pkt_filter.h"
 #include "filter_policy.h"
+#include "perf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,6 +80,10 @@ static pkt_filter_t filter;
  * The ISR only raises a flag; the main loop does the toggle and the printing. */
 static volatile uint8_t button_pressed;   /* set by the button ISR, cleared by main */
 static uint8_t log_frames = 1u;           /* 1 = print one line per frame (yellow LED on) */
+
+/* CPU cycles spent in pkt_filter_process() per frame (parse + all filter
+ * stages), collected over one stats period and printed with the stats. */
+static perf_stats_t filter_cycles;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -205,6 +210,10 @@ int main(void)
   printf("ETH RX started\r\n");
   /* Read back from the RCC registers: proves the PLL really runs (550 MHz). */
   printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
+  perf_init();
+  perf_reset(&filter_cycles);
+  printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
+         (unsigned long)perf_overhead());
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 
@@ -222,9 +231,13 @@ int main(void)
     while (eth_rx_pop(&pkt))
     {
       /* Parse, drop if malformed or the MAC reported a checksum error, else
-       * run the rules. Counters are updated inside. */
+       * run the rules. Counters are updated inside. HAL_GetTick() is read
+       * before the timer starts so only the filter itself is measured. */
+      uint32_t now_ms = HAL_GetTick();
+      uint32_t t0 = perf_now();
       pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
-                                           HAL_GetTick(), &hdr);
+                                           now_ms, &hdr);
+      perf_record(&filter_cycles, perf_now() - t0);
 
       if (log_frames != 0u)
       {
@@ -495,6 +508,22 @@ static void print_stats(void)
   }
 
   printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
+
+  /* Filter cost per frame over the last period, then start a new period. */
+  if (filter_cycles.count == 0u)
+  {
+    printf("--- filter cycles: no frames ---\r\n");
+  }
+  else
+  {
+    uint32_t avg = (uint32_t)(filter_cycles.sum / filter_cycles.count);
+    printf("--- filter cycles/frame (%lu frames): min %lu avg %lu max %lu"
+           " = avg %lu ns ---\r\n",
+           (unsigned long)filter_cycles.count, (unsigned long)filter_cycles.min,
+           (unsigned long)avg, (unsigned long)filter_cycles.max,
+           (unsigned long)perf_cycles_to_ns(avg));
+  }
+  perf_reset(&filter_cycles);
 }
 /* USER CODE END 4 */
 
