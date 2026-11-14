@@ -15,6 +15,7 @@ then send traffic from the BBB, e.g.:
 Wiring: analyzer GND -> board GND, analyzer CH1 (sigrok D0) -> D13.
 """
 import argparse
+import collections
 import re
 import statistics
 import subprocess
@@ -56,21 +57,31 @@ def main():
     print(f"Capturing {args.seconds} s at {rate / 1e6:g} MHz "
           f"(resolution {1e9 / rate:.0f} ns). Waiting for the first pulse...",
           file=sys.stderr)
-    data = subprocess.run(cmd, stdout=subprocess.PIPE, check=True).stdout
-    if len(data) < samples:
-        print(f"warning: got {len(data)} of {samples} samples "
-              f"(USB too slow? try a lower --rate)", file=sys.stderr)
-
     # One byte per sample, bit N = channel DN. Keep only our channel as 0/1.
     mask = 1 << bit
     table = bytes((1 if (b & mask) else 0) for b in range(256))
-    levels = data.translate(table)
 
+    # Read the capture in chunks (a long capture would not fit in memory) and
+    # measure every HIGH run; a run can continue across a chunk boundary.
     widths = []
-    for m in re.finditer(rb"\x01+", levels):
-        if m.end() == len(levels):
-            break                     # still HIGH when the capture ended: incomplete
-        widths.append(m.end() - m.start())
+    high_len = 0          # length of the HIGH run in progress, 0 = pin is LOW
+    total = 0
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
+        while True:
+            chunk = proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            for m in re.finditer(rb"\x01+|\x00+", chunk.translate(table)):
+                if m.group()[0] == 1:
+                    high_len += m.end() - m.start()
+                elif high_len:
+                    widths.append(high_len)
+                    high_len = 0
+    # high_len != 0 here means still HIGH when the capture ended: incomplete, ignored.
+    if total < samples:
+        print(f"warning: got {total} of {samples} samples "
+              f"(USB too slow? try a lower --rate)", file=sys.stderr)
 
     if not widths:
         print("No complete pulses captured.")
@@ -82,6 +93,12 @@ def main():
     print(f"width  min {min(us):.3f} us  avg {avg:.3f} us  max {max(us):.3f} us")
     print(f"       = avg {avg * CPU_HZ / 1e6:.0f} CPU cycles at 550 MHz "
           f"(+/- {CPU_HZ / rate:.0f} cycles per sample)")
+
+    # Histogram: frames that take different paths through the filter show up
+    # as separate groups of widths.
+    print("histogram (width -> pulses):")
+    for w, n in sorted(collections.Counter(widths).items()):
+        print(f"  {w * 1e6 / rate:7.3f} us = {w * CPU_HZ / rate:5.0f} cycles : {n}")
     return 0
 
 

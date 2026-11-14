@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame, GPIO pulse for the logic analyzer |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -207,8 +207,14 @@ tests check exactly this table. Default deny: anything not listed is dropped.
   CubeMX, very high speed) is HIGH while `pkt_filter_process()` runs. The pin
   is written through `BSRR` (one store) so the edges add almost nothing.
   `tools/la/pulse_width.py` captures it with a logic analyzer (sigrok-cli) and
-  prints min / avg / max pulse width. It matches the DWT number (see
+  prints min / avg / max pulse width and a histogram of widths (frames that
+  take different paths form separate groups). It reads the capture in 1 MB
+  chunks, so long captures fit in memory. It matches the DWT number (see
   Performance).
+- Per-path stats: each frame's cycles are also added to the stats of its
+  path (drop stage, or matched rule + pass / rate-limit), kept since boot and
+  printed as `--- cycles by path (since boot) ---` after every period that
+  had frames.
 
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
@@ -375,8 +381,92 @@ D13.
 header). Order per run: start the script (it waits for the first pulse), then
 send from the BBB.
 
-**Still to measure:** cost per scenario (early drops such as `malformed`
-vs. a full rule walk), the stress ramp (drop point), and an optimised build.
+### Filter cost per path
+
+Every frame's cost is also recorded by the path it took through the filter
+(`--- cycles by path (since boot) ---` block under the stats): which stage
+dropped it, or which rule it matched and whether it passed or hit the rate
+limit. One run of every BBB scenario, same setup as above (Debug `-O0`,
+550 MHz, caches on, log OFF), all on one boot:
+
+| Path (where the verdict is made) | Frames | min / avg / max (cycles) | avg time |
+|----------------------------------|--------|--------------------------|----------|
+| `malformed` (stage 1, sanity)            | 54  |  571 /  852 / 1137 | 1.55 us |
+| `bad-checksum` (stage 1, MAC report)     | 12  | 1166 / 1177 / 1233 | 2.14 us |
+| `spoofed` (stage 2, anti-spoofing)       | 24  | 1225 / 1260 / 1360 | 2.29 us |
+| `tcp-scan` (stage 3, scan detection)     | 30  | 1357 / 1388 / 1437 | 2.52 us |
+| rule `ping` (#2) pass                    | 76  | 1471 / 1527 / 1569 | 2.78 us |
+| rule `ping` (#2) rate-limit drop         | 164 | 1491 / 1519 / 1560 | 2.76 us |
+| rule `udp-test` (#5) pass                | 27  | 1832 / 1859 / 1899 | 3.38 us |
+| `default` drop (no rule matched)         | 36  | 1785 / 1860 / 2373 | 3.38 us |
+| rule `tcp` (#4) pass                     | 6   | 1922 / 1942 / 2003 | 3.53 us |
+| rule `tcp-new` (#3) rate-limit drop      | 42  | 1915 / 1946 / 1996 | 3.54 us |
+| rule `tcp-new` (#3) pass                 | 58  | 1924 / 1958 / 2064 | 3.56 us |
+
+Every counter moved by exactly what the scenario promises (e.g. `malformed
+--count 2`: malformed +18, bad-checksum +4, passed +2; `spoof --count 2`:
+spoofed +12, default +2). `default` also holds the BBB's own background
+frames (DHCP), hence its wider max.
+
+**Logic analyzer cross-check, per scenario** (pulse-width histogram, which
+splits the paths from outside the chip):
+
+| Scenario | Frames | Pulses | Groups seen by the analyzer | Analyzer avg vs. DWT avg |
+|----------|--------|--------|-----------------------------|--------------------------|
+| `normal --count 11`      | 11  | 11  | one group, 1788-1879 cycles | 1808 vs 1849 |
+| `spoof --count 2`        | 14  | 14  | 12 spoofed at 1192-1329 + 2 default at 1742 | 1238 vs ~1270 (spoofed) |
+| `scan --count 3`         | 18  | 18  | 15 scans at 1329-1421 + 3 tcp pass at 1879 | 1360 vs ~1390 (scans) |
+| `malformed --count 2`    | 24  | 23  | 8 at 550-642 + 10 at 917-1100 (malformed), 4 at 1146 (bad-checksum), 1 pass | 838 vs ~854 (malformed) |
+| `syn-flood --count 100`  | 100 | 100 | one group, 1879-2017 | 1914 vs ~1953 |
+| `ping-flood --count 120` | 120 | 120 | one group, 1375-1558 (6 MHz, +/- 92 cycles) | 1493 vs 1523 |
+
+The analyzer saw every frame except one control frame at the end of the
+`malformed` run (the last frames sent; the capture window most likely
+closed first). The same ~20-40 cycle offset as above appears in every run.
+
+**What the numbers say**
+- **The earlier a frame is decided, the cheaper it is.** The cost grows with
+  the pipeline order: sanity (malformed, ~850) < MAC checksum report (~1180)
+  < anti-spoofing (~1260) < scan detection (~1390) < rule table (1520-1960).
+  Bad traffic that is caught early is cheap: a malformed frame costs less
+  than half of a frame that passes.
+- **The analyzer even sees the order inside one stage.** The malformed run
+  splits into two groups: 8 frames at ~600 cycles (4 broken IPv4 header kinds
+  x 2: version, IHL, total length) and 10 at ~1000 (5 broken TCP/UDP header
+  or fragment kinds x 2), which are only checked after the IPv4 header has
+  been parsed.
+- **First match: rule position matters.** Among non-TCP frames, `ping`
+  (matched by rule #2) costs ~1520 cycles and `udp-test` (rule #5) ~1860:
+  about 110 cycles for every rule checked before the match (Debug build). A
+  frame that matches nothing walks all 5 rules (`default`, ~1860). The most
+  common traffic should sit at the top of the table.
+- **TCP costs more than its rule position.** TCP frames (rules #3 and #4)
+  cost ~1950, more than `udp-test` at #5: the TCP header is parsed further
+  and goes through scan detection.
+- **A rate-limited drop costs the same as a pass** (ping 1519 vs 1527,
+  tcp-new 1946 vs 1958): the token bucket is checked only after the frame has
+  walked the whole pipeline and matched its rule. During a flood the filter
+  pays full price for every frame. Rate limiting protects what is behind the
+  board, not the board's own CPU; an early per-source block (before the
+  rules) would make flood frames cheap.
+- **Token buckets behave as configured.** `ping-flood --count 120` gave
+  38 passed / 82 rate-limited twice in a row (burst 5 + 10/s for ~3.3 s, the
+  BBB sends ~36 frames/s); `syn-flood --count 100` gave 58 / 42 (burst 5 +
+  20/s for ~2.6 s).
+
+**How the data was collected** (and what went wrong)
+- The board was flashed once and not reset, so the per-path numbers add up
+  over all runs. Every run used its own `--count`, and the counters' change
+  proved which run each stats line belongs to. The PuTTY session was logged
+  to a file and the numbers were read from it.
+- The analyzer script starts on the first rising edge. Three times it
+  started on a background frame from the BBB (its DHCP client) and its window
+  ended before the scenario was sent (1 pulse instead of 11, 24, 120). Those
+  captures were thrown away and repeated with a longer window (`--seconds 10`
+  or `--seconds 20 --rate 6m`).
+
+**Still to measure:** the stress ramp (the rate where frames start to be
+lost, and recovery after "RX buffer unavailable"), and an optimised build.
 
 ## BBB test link
 
@@ -476,6 +566,12 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Rate limits are per rule, shared by all senders: a flood is capped, but it
   also takes the share of honest senders. Per-source buckets (a hash table
   keyed by source IP, plus the total cap) would make it fair.
+- A rate-limited frame costs as much CPU as a passed one (measured, see
+  Performance): the bucket is checked after the full pipeline, so a flood is
+  capped but not cheap to filter.
+- The BBB's `eth0` still runs a DHCP client (left from the Scapy install), so
+  it sends a background frame now and then; it lands in `default` and can
+  start an analyzer capture early.
 - No device can stop a flood larger than its link: that has to be filtered
   upstream.
 - Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is

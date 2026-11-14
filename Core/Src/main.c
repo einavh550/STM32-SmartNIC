@@ -84,6 +84,16 @@ static uint8_t log_frames = 1u;           /* 1 = print one line per frame (yello
 /* CPU cycles spent in pkt_filter_process() per frame (parse + all filter
  * stages), collected over one stats period and printed with the stats. */
 static perf_stats_t filter_cycles;
+
+/* The same cost split by the path the frame took through the filter, since
+ * boot (never reset), so each scenario's frame types can be told apart:
+ *   path_reason[r]  dropped before any rule matched (malformed, bad-checksum,
+ *                   spoofed, tcp-scan) or by the default action
+ *   path_pass[i]    matched rule i and passed
+ *   path_limit[i]   matched rule i and was dropped by its rate limit       */
+static perf_stats_t path_reason[DROP_REASON_COUNT];
+static perf_stats_t path_pass[POLICY_RULE_COUNT];
+static perf_stats_t path_limit[POLICY_RULE_COUNT];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,6 +105,8 @@ static void MX_ETH_Init(void);
 static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v);
 static void print_stats(void);
 static void handle_button(void);
+static void record_path(pkt_verdict_t v, uint32_t cycles);
+static void print_paths(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -212,6 +224,15 @@ int main(void)
   printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
   perf_init();
   perf_reset(&filter_cycles);
+  for (uint32_t i = 0u; i < DROP_REASON_COUNT; i++)
+  {
+    perf_reset(&path_reason[i]);
+  }
+  for (uint32_t i = 0u; i < POLICY_RULE_COUNT; i++)
+  {
+    perf_reset(&path_pass[i]);
+    perf_reset(&path_limit[i]);
+  }
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
   printf("Per-frame log ON (USER button toggles)\r\n");
@@ -244,7 +265,9 @@ int main(void)
       pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
                                            now_ms, &hdr);
       PERF_PIN_GPIO_Port->BSRR = (uint32_t)PERF_PIN_Pin << 16;
-      perf_record(&filter_cycles, perf_now() - t0);
+      uint32_t cycles = perf_now() - t0;
+      perf_record(&filter_cycles, cycles);
+      record_path(v, cycles);
 
       if (log_frames != 0u)
       {
@@ -540,8 +563,53 @@ static void print_stats(void)
            (unsigned long)filter_cycles.count, (unsigned long)filter_cycles.min,
            (unsigned long)avg, (unsigned long)filter_cycles.max,
            (unsigned long)perf_cycles_to_ns(avg));
+    print_paths();   /* only when something new arrived, to keep the log short */
   }
   perf_reset(&filter_cycles);
+}
+
+/** Add one frame's cost to the stats of the path it took. */
+static void record_path(pkt_verdict_t v, uint32_t cycles)
+{
+  if ((v.rule_idx >= 0) && (v.rule_idx < (int32_t)POLICY_RULE_COUNT))
+  {
+    perf_record((v.reason == DROP_REASON_RATE_LIMIT) ? &path_limit[v.rule_idx]
+                                                     : &path_pass[v.rule_idx],
+                cycles);
+  }
+  else if ((uint32_t)v.reason < DROP_REASON_COUNT)
+  {
+    perf_record(&path_reason[v.reason], cycles);
+  }
+}
+
+static void print_one_path(const char *name, const char *suffix, const perf_stats_t *s)
+{
+  if (s->count == 0u)
+  {
+    return;
+  }
+  uint32_t avg = (uint32_t)(s->sum / s->count);
+  printf("    path %-12s%-12s n=%-5lu min %5lu avg %5lu max %5lu cycles = avg %5lu ns\r\n",
+         name, suffix, (unsigned long)s->count, (unsigned long)s->min,
+         (unsigned long)avg, (unsigned long)s->max,
+         (unsigned long)perf_cycles_to_ns(avg));
+}
+
+/** Cycles per frame for every path seen since boot. */
+static void print_paths(void)
+{
+  printf("--- cycles by path (since boot) ---\r\n");
+  for (uint32_t r = 0u; r < DROP_REASON_COUNT; r++)
+  {
+    print_one_path((r == DROP_REASON_NONE) ? "pass" : pkt_drop_reason_name((pkt_drop_reason_t)r),
+                   "", &path_reason[r]);
+  }
+  for (uint32_t i = 0u; i < POLICY_RULE_COUNT; i++)
+  {
+    print_one_path(filter_policy_rule_name((int32_t)i), "pass", &path_pass[i]);
+    print_one_path(filter_policy_rule_name((int32_t)i), "rate-limit", &path_limit[i]);
+  }
 }
 /* USER CODE END 4 */
 
