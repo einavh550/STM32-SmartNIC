@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes) |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -465,8 +465,140 @@ closed first). The same ~20-40 cycle offset as above appears in every run.
   captures were thrown away and repeated with a longer window (`--seconds 10`
   or `--seconds 20 --rate 6m`).
 
-**Still to measure:** the stress ramp (the rate where frames start to be
-lost, and recovery after "RX buffer unavailable"), and an optimised build.
+### Stress test setup (in progress)
+
+- Scapy sends only ~40 frames/s from the BBB, far below what the filter can
+  take. `tools/bbb/stress.sh` uses Linux **pktgen** (a packet generator in the
+  kernel) to send the same 60-byte UDP frame to port 5000 (rule `udp-test`)
+  at rising rates: 1k, 2k, 5k, 10k, 20k, 50k frames/s, then as fast as
+  possible.
+- To see where frames are lost, the board now prints a hardware line every
+  5 s: `--- hw: mac rx unicast N | filter saw M | fifo-overflow X dma-missed
+  Y | rbu Z | free bufs F/16 ---`. `mac rx unicast` is the MAC's own counter
+  (MMC `RX unicast good`), `fifo-overflow` / `dma-missed` are the MTL RX queue
+  drop counters (clear-on-read, summed every main-loop pass), `rbu` counts
+  DMA "receive buffer unavailable" interrupts (`HAL_ETH_ErrorCallback`), and
+  `free bufs` is the pool's free ring. Frames sent by pktgen vs. `mac rx` vs.
+  `passed` shows whether a frame was lost on the wire, in the MAC / DMA, or
+  in software.
+
+### Stress run 1: reception died for good at 1000 frames/s
+
+| | Frames |
+|---|---|
+| Sent by pktgen (all 7 steps)       | 564 000 (max step: 300 000 in 2.02 s = 148 840 frames/s, the 100 Mbit/s line rate for 64-byte frames) |
+| Received by the MAC (`mac rx unicast`) | 564 000: nothing lost on the wire |
+| Seen by the filter                 | 892, then nothing until reset |
+| Dropped in the MAC RX FIFO         | 554 949 |
+
+The board died in the **first** step, 1000 frames/s, although the filter
+alone could take ~290 000/s. The log shows the moment:
+`mac rx unicast 892 | filter saw 884 | rbu 1 | free bufs 0/16`, and from then
+on `free bufs 15/16` with nothing received. Two bugs together:
+
+1. **The stats print blocks the main loop.** Every 5 s it prints ~600
+   characters; at 115 200 baud that is ~50 ms in which no frame is processed.
+   At 1000 frames/s ~50 frames arrive in that time, but there are only 16
+   buffers: the pool runs empty and the DMA raises "receive buffer
+   unavailable" (RBU) and suspends.
+2. **Nothing ever woke the DMA up again (the serious one).** The main loop
+   freed the buffers, but descriptors are only refilled inside
+   `HAL_ETH_ReadData()`, which only the RX interrupt called, and a suspended
+   DMA receives nothing, so there is no RX interrupt: a deadlock. One short
+   overload killed reception until reset.
+
+**Fix for bug 2:** `eth_rx_refill()`, called every main-loop pass. If the HAL
+still has descriptors without a buffer (`RxDescList.RxBuildDescCnt != 0`),
+it calls `HAL_ETH_ReadData()` with the ETH interrupt masked (the HAL's
+descriptor bookkeeping is not reentrant). That gives the freed buffers to
+the descriptors and writes the DMA tail pointer, which resumes a suspended
+DMA. The hw line counts these as `refills`. Bug 1 (blocking UART output) is
+next.
+
+### Stress run 2: with the DMA recovery fix
+
+Same ramp, same frames. Totals after each step (read from the stats lines):
+
+| After step | Rate | Sent (total) | MAC got | Passed | Lost (total) | rbu / refills |
+|---|---|---|---|---|---|---|
+| 1 | 1 000/s | 3 000 | 3 000 | 2 993 | 7 | 3 / 3 |
+| 2 | 2 000/s | 9 000 | 9 000 | 8 934 | 66 | 6 / 6 |
+| 3 | 5 000/s | 24 000 | 24 000 | 23 720 | 280 | 9 / 9 |
+| 6 | 50 000/s | 264 000 | 264 000 | 263 720 | 280 (+0 in steps 4-6) | 9 / 9 |
+| 7 | max, 148 840/s | 564 000 | 564 000 | 563 720 | 280 (+0) | 9 / 9 |
+
+- **The board survives overload.** The DMA ran out of buffers 9 times and
+  was woken up 9 times (`rbu` = `refills`). Before the fix the first time
+  was fatal.
+- **The filter keeps up with the 100 Mbit/s line rate.** Step 7 delivered
+  300 000 minimum-size frames at 148 840 frames/s, the most a 100 Mbit/s
+  link can carry, and all 300 000 passed (one 5 s window: `300000 frames`,
+  min 1821 / avg 1851 / max 1961 cycles, the same 3.37 us per frame as at
+  low rate). At line rate the filter uses about half of the CPU
+  (148 840 x 3.37 us = 0.50 s per second). On this link the bottleneck is
+  the cable, not the filter.
+- **Every lost frame was lost while the stats were printing.** The 280
+  losses all happened in steps 1-3, where a stats print fell inside a step
+  (snapshots during those steps show `free bufs 0/16`). In steps 4-7 the
+  prints happened to fall in the 12 s pauses: luck, not a fix. Under
+  constant traffic every print would lose frames (~50 ms x 148 840/s ≈ 7 400
+  frames at line rate). That is bug 1.
+
+**Fix for bug 1: non-blocking log output (`uart_log.[ch]`).** `printf` used
+to end in `HAL_UART_Transmit()`, which waits ~87 us for every character. Now
+`_write` (overriding the weak one in `syscalls.c`) only copies the text into
+a 4 KB RAM ring and returns; the USART3 "transmit register empty" interrupt
+sends one byte per interrupt in the background and switches itself off when
+the ring is empty. Single producer (main loop) / single consumer (ISR), like
+the frame rings. USART3 has priority 5, below ETH (0), so frames always come
+first; enabling the TX interrupt masks only USART3, never ETH. If a write
+does not fit, the whole write is dropped and counted (`log-drop` in the hw
+line): losing log text is better than losing frames. USART3 belongs to the
+Nucleo BSP (COM1), not to a CubeMX peripheral, so its NVIC setup is in
+`uart_log_init()`.
+- The run was not captured in the PuTTY log file (logging was off after
+  the reflash); the numbers above are from the stats lines on screen.
+
+### Stress run 3: both fixes, zero loss at line rate
+
+Same frames, logged to a file (`putty_stress3.log`). Test A is the same
+ramp; test B is sustained line rate (`sudo MAX_COUNT=4500000 sh stress.sh 0`,
+4.5 million frames, ~31 s), so it must overlap ~6 stats prints.
+
+| Test | Sent | MAC got | Passed | `fifo-overflow` | `dma-missed` | `rbu` / `refills` | `log-drop` |
+|---|---|---|---|---|---|---|---|
+| A: ramp 1k ... max | 564 000 | 564 000 | 564 000 | 0 | 0 | 19 / 4 | 0 |
+| B: 31 s at max (totals A+B) | 5 064 000 | 5 064 000 | 5 064 000 | 0 | 0 | 66 / 28 | 0 |
+
+- **No frame lost.** During test B every 5 s window held ~730 500 frames
+  (~146 000 frames/s, the line rate) and every one passed, while the stats
+  were printed every 5 s.
+- **RBU is harmless now.** At line rate the DMA still runs out of
+  descriptors for a moment (`rbu` 66), but the MAC's RX FIFO holds the next
+  frames for those few microseconds and the main loop re-arms the DMA
+  (`refills`), so nothing overflows. Before fix 1 the first RBU was fatal.
+- **The filter's cost does not change under load:** min / avg 1819 / 1847
+  cycles in every window, as at 10 frames/s. Only `max` grows, to
+  3000-3600 cycles at line rate: frames whose measurement was interrupted by
+  the next frame's ETH interrupt. That puts the RX interrupt itself at about
+  1 500 cycles (~2.7 us, Debug build). Filter + interrupt ≈ 6 us per frame
+  against 6.7 us between frames at line rate: the CPU is close to fully
+  busy.
+- **Margin:** at the moments the stats are printed during line-rate traffic
+  only `free bufs 3/16` remain. Formatting the text (printf turning numbers
+  into characters) still holds the main loop for roughly 60-90 us, and ~10
+  frames queue up meanwhile. Safe, but 3 buffers from the edge.
+
+**Summary of the stress tests**
+
+| Run | Firmware | Result |
+|---|---|---|
+| 1 | before fixes | reception died for good after 892 frames at 1 000 frames/s |
+| 2 | + DMA recovery (`eth_rx_refill`) | survives; 280 frames lost, all during blocking stats prints |
+| 3 | + non-blocking log (`uart_log`) | 5 064 000 of 5 064 000 frames, 31 s at line rate, 0 lost |
+
+**Still to measure:** an optimised (`-O2`) build, and heavier work per frame
+(more rules) to find where the CPU, not the cable, becomes the limit.
 
 ## BBB test link
 
@@ -540,11 +672,13 @@ Core/Inc, Core/Src
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
   perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max
+  uart_log.[ch]          non-blocking printf: RAM ring + USART3 TX interrupt
   pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
   filter_policy.[ch]     the rule table the board runs (BBB link)
   main.c                 init sequence, main loop, rule table and counters
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
+tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
 tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
 tests/                   host unit tests (parser, filter) + Makefile
 .github/workflows/       CI: runs the host tests on every push
@@ -554,8 +688,12 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 
 ## Known limitations
 
-- If all 16 buffers are in use, the DMA stops with "RX buffer unavailable" and is
-  not yet restarted automatically when buffers are freed.
+- Log output is limited to 115 200 baud (~11 500 characters/s). With the
+  per-frame log ON at high rates the 4 KB log ring fills and whole log lines
+  are dropped (counted as `log-drop`); frames are not affected.
+- At line rate, formatting the stats (~60-90 us of printf) leaves only 3 of
+  the 16 RX buffers free. More stats text, or more work per frame, would need
+  a bigger pool or printing the stats in smaller pieces.
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.

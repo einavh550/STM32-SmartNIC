@@ -142,6 +142,72 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
  * Length = number of bytes the DMA wrote.
  * Zero-copy: we only push the buffer's ADDRESS, length and the MAC's
  * checksum report, never the bytes. */
+/* ------------------------------------------------------------------------- */
+/* Hardware drop counters (stress tests)                                     */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t fifo_overflow_total;     /* main loop only */
+static uint32_t dma_missed_total;        /* main loop only */
+static volatile uint32_t rbu_total;      /* written by the ETH ISR */
+static uint32_t refill_total;            /* main loop only */
+
+void eth_rx_refill(void)
+{
+    /* RxBuildDescCnt = descriptors the HAL still has to give a buffer to.
+     * 0 in normal operation (the ISR refills at once). One aligned 32-bit
+     * read is atomic; if the ISR changes it right after, we just act one
+     * loop pass later. */
+    if (heth.RxDescList.RxBuildDescCnt == 0u)
+    {
+        return;
+    }
+
+    /* HAL_ETH_ReadData() rebuilds the empty descriptors from free_ring and
+     * writes the DMA tail pointer, which resumes a suspended DMA. It also
+     * reads any frame already finished (-> pkt_ring). The ISR calls it too,
+     * and the HAL's descriptor bookkeeping is not reentrant, so keep the ETH
+     * interrupt off meanwhile (at most 4 descriptors: a few microseconds).
+     * With the interrupt off, main is the only producer of pkt_ring for
+     * that moment, so the ring stays single-producer. */
+    HAL_NVIC_DisableIRQ(ETH_IRQn);
+    void *frame;
+    while (HAL_ETH_ReadData(&heth, &frame) == HAL_OK)
+    {
+    }
+    HAL_NVIC_EnableIRQ(ETH_IRQn);
+
+    refill_total++;
+}
+
+/* The HAL calls this from the ETH ISR on an "abnormal" DMA interrupt. With
+ * enough traffic the only one we expect is RBU: the DMA wanted a descriptor
+ * to write the next frame into, and none had a buffer (pool empty). */
+void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *h)
+{
+    if ((h->DMAErrorCode & ETH_DMACSR_RBU) != 0u)
+    {
+        rbu_total++;
+    }
+}
+
+void eth_rx_poll_hw(void)
+{
+    /* Both 11-bit fields are cleared by this read, so add them up here. */
+    uint32_t r = heth.Instance->MTLRQMPOCR;
+    fifo_overflow_total += (r & ETH_MTLRQMPOCR_OVFPKTCNT_Msk) >> ETH_MTLRQMPOCR_OVFPKTCNT_Pos;
+    dma_missed_total    += (r & ETH_MTLRQMPOCR_MISPKTCNT_Msk) >> ETH_MTLRQMPOCR_MISPKTCNT_Pos;
+}
+
+void eth_rx_get_stats(eth_rx_stats_t *out)
+{
+    out->mac_rx_good   = heth.Instance->MMCRUPGR;   /* 32-bit, not cleared on read */
+    out->fifo_overflow = fifo_overflow_total;
+    out->dma_missed    = dma_missed_total;
+    out->rbu_events    = rbu_total;
+    out->refills       = refill_total;
+    out->free_bufs     = rb_count(&free_ring);
+}
+
 void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t Length)
 {
     pkt_desc_t d = { .data = buff, .len = Length, .flags = rx_csum_flags(buff) };

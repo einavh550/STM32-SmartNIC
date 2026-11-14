@@ -28,6 +28,7 @@
 #include "pkt_filter.h"
 #include "filter_policy.h"
 #include "perf.h"
+#include "uart_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -180,6 +181,10 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* From here printf only queues text; the USART3 interrupt sends it
+   * (uart_log.c). COM1 (USART3) was just set up by BSP_COM_Init() above. */
+  uart_log_init();
+
 #ifdef RB_SELF_TEST
   BSP_LED_On((rb_self_test() == 0u) ? LED_GREEN : LED_RED);
 #endif
@@ -278,7 +283,12 @@ int main(void)
       eth_rx_buf_free(pkt.data);
     }
 
+    /* Buffers were just freed: hand them to any RX descriptor left without
+     * one, and wake the DMA if it stopped (see eth_rx_refill()). */
+    eth_rx_refill();
+
     handle_button();
+    eth_rx_poll_hw();   /* collect the MAC's clear-on-read drop counters */
 
     /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
     if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
@@ -549,6 +559,23 @@ static void print_stats(void)
   }
 
   printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
+
+  /* Hardware view: frames the MAC took off the wire vs. frames the filter
+   * saw. MAC counts unicast only, so broadcasts (DHCP) appear only in "seen". */
+  eth_rx_stats_t hw;
+  eth_rx_get_stats(&hw);
+  uint32_t seen = filter.passed;
+  for (uint32_t r = 0u; r < DROP_REASON_COUNT; r++)
+  {
+    seen += filter.dropped[r];
+  }
+  printf("--- hw: mac rx unicast %lu | filter saw %lu | fifo-overflow %lu"
+         " dma-missed %lu | rbu %lu refills %lu | free bufs %lu/%u | log-drop %lu ---\r\n",
+         (unsigned long)hw.mac_rx_good, (unsigned long)seen,
+         (unsigned long)hw.fifo_overflow, (unsigned long)hw.dma_missed,
+         (unsigned long)hw.rbu_events, (unsigned long)hw.refills,
+         (unsigned long)hw.free_bufs,
+         (unsigned)ETH_RX_BUF_COUNT, (unsigned long)uart_log_dropped());
 
   /* Filter cost per frame over the last period, then start a new period. */
   if (filter_cycles.count == 0u)
