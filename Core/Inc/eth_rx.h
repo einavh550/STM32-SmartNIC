@@ -75,6 +75,8 @@ typedef struct
     uint32_t rbu_events;     /**< DMA "receive buffer unavailable" interrupts.      */
     uint32_t refills;        /**< Times the main loop re-armed starved descriptors. */
     uint32_t free_bufs;      /**< Pool buffers free right now (of ETH_RX_BUF_COUNT). */
+    uint32_t free_low;       /**< Fewest free buffers ever seen, since boot.       */
+    uint32_t pool_empty;     /**< Times the DMA asked for a buffer and none was left. */
 } eth_rx_stats_t;
 
 /** Read the MAC's clear-on-read drop counters into the totals. Call often
@@ -83,5 +85,10 @@ void eth_rx_poll_hw(void);
 
 /** Copy of the totals since boot. */
 void eth_rx_get_stats(eth_rx_stats_t *out);
+
+/** Fewest free buffers seen since the previous call (one stats period),
+ *  then start a new period. The "free bufs" number above is only a snapshot
+ *  at print time; this is the real low point in between. */
+uint32_t eth_rx_take_period_low(void);
 
 #endif /* INC_ETH_RX_H_ */

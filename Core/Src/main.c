@@ -570,12 +570,15 @@ static void print_stats(void)
     seen += filter.dropped[r];
   }
   printf("--- hw: mac rx unicast %lu | filter saw %lu | fifo-overflow %lu"
-         " dma-missed %lu | rbu %lu refills %lu | free bufs %lu/%u | log-drop %lu ---\r\n",
+         " dma-missed %lu | rbu %lu refills %lu | free bufs %lu/%u"
+         " (low: period %lu, ever %lu, empty %lu) | log-drop %lu ---\r\n",
          (unsigned long)hw.mac_rx_good, (unsigned long)seen,
          (unsigned long)hw.fifo_overflow, (unsigned long)hw.dma_missed,
          (unsigned long)hw.rbu_events, (unsigned long)hw.refills,
          (unsigned long)hw.free_bufs,
-         (unsigned)ETH_RX_BUF_COUNT, (unsigned long)uart_log_dropped());
+         (unsigned)ETH_RX_BUF_COUNT, (unsigned long)eth_rx_take_period_low(),
+         (unsigned long)hw.free_low, (unsigned long)hw.pool_empty,
+         (unsigned long)uart_log_dropped());
 
   /* Filter cost per frame over the last period, then start a new period. */
   if (filter_cycles.count == 0u)

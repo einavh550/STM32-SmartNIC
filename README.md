@@ -481,6 +481,14 @@ closed first). The same ~20-40 cycle offset as above appears in every run.
   `free bufs` is the pool's free ring. Frames sent by pktgen vs. `mac rx` vs.
   `passed` shows whether a frame was lost on the wire, in the MAC / DMA, or
   in software.
+- `free bufs` alone is a snapshot taken once per 5 s. The line also shows
+  **low-water marks**: `low: period P, ever E, empty Z`, the fewest free
+  buffers seen in this 5 s period and since boot, and how often the DMA asked
+  for a buffer when none was left. They are updated in
+  `HAL_ETH_RxAllocateCallback()`, the only place a buffer is taken. Note that
+  an idle board shows `12/16`, not `16/16`: 4 buffers are always parked in
+  the 4 RX DMA descriptors, waiting for the next frames. 12 is the real
+  headroom for frames waiting on the main loop.
 
 ### Stress run 1: reception died for good at 1000 frames/s
 
@@ -587,7 +595,37 @@ ramp; test B is sustained line rate (`sudo MAX_COUNT=4500000 sh stress.sh 0`,
 - **Margin:** at the moments the stats are printed during line-rate traffic
   only `free bufs 3/16` remain. Formatting the text (printf turning numbers
   into characters) still holds the main loop for roughly 60-90 us, and ~10
-  frames queue up meanwhile. Safe, but 3 buffers from the edge.
+  frames queue up meanwhile. This snapshot looked like a margin of 3
+  buffers; edge test 1 below shows the real low point is 0.
+
+### Edge test 1: how close does the pool get to empty?
+
+`free bufs 3/16` above is a snapshot taken at print time. With the
+low-water marks (`putty_edge.log`, `sudo MAX_COUNT=1500000 sh stress.sh 0`,
+~10 s at line rate):
+
+| 5 s window | Frames | Lost | Fewest free buffers in the window | Pool found empty (total) | `rbu` (total) |
+|---|---|---|---|---|---|
+| 1 | 639 581 | 0 | 3 | 0  | 0  |
+| 2 | 730 368 | 0 | **0** | 32 | 9  |
+| 3 (end) | 130 051 | 0 | **0** | 60 | 16 |
+
+Total: 1 500 000 sent, 1 500 000 passed.
+
+- **The pool does run empty at line rate:** 60 times in ~10 s the DMA asked
+  for a buffer and none was left. The snapshot (`3/16`) hid this. The real
+  margin of the 16-buffer pool at line rate is **zero**, not 3.
+- **Still no frame was lost** because of a second, hardware buffer: the
+  MAC's own RX FIFO (MTL queue) keeps receiving while the DMA waits, and
+  `eth_rx_refill()` re-arms the DMA before that FIFO overflows
+  (`fifo-overflow` stayed 0). So line rate works today on pool + FIFO
+  together, with little to spare.
+- **Growing the pool is limited by memory:** the pool must sit in D2 SRAM
+  (the non-cacheable MPU region the ETH DMA uses), which is 32 KB; 16 x
+  1536 B = 24.5 KB already, so ~20 buffers is the most that fits. More would
+  need the pool in AXI SRAM (D1, 320 KB) with its own non-cacheable MPU
+  region. The cheaper levers are shorter main-loop stalls (print the stats
+  in pieces) and more RX descriptors.
 
 **Summary of the stress tests**
 
@@ -691,9 +729,10 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Log output is limited to 115 200 baud (~11 500 characters/s). With the
   per-frame log ON at high rates the 4 KB log ring fills and whole log lines
   are dropped (counted as `log-drop`); frames are not affected.
-- At line rate, formatting the stats (~60-90 us of printf) leaves only 3 of
-  the 16 RX buffers free. More stats text, or more work per frame, would need
-  a bigger pool or printing the stats in smaller pieces.
+- At line rate the 16-buffer pool runs empty for moments (low-water mark 0,
+  edge test 1); no frame is lost only because the MAC's RX FIFO covers the
+  gap. More stats text, or more work per frame, would need a bigger pool
+  (limited by the 32 KB D2 SRAM) or printing the stats in smaller pieces.
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.

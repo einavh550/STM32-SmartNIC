@@ -120,6 +120,9 @@ static uint16_t rx_csum_flags(const uint8_t *buff)
 /* HAL callbacks (override the __weak versions in stm32h7xx_hal_eth.c)       */
 /* ------------------------------------------------------------------------- */
 
+static void note_free_count(uint32_t n);   /* low-water marks, see below */
+static volatile uint32_t pool_empty_total; /* allocations that found the pool empty */
+
 /* The HAL calls this when an RX descriptor needs an empty buffer.
  * Returning NULL is allowed: the HAL leaves that descriptor empty and
  * asks again on the next HAL_ETH_ReadData(). */
@@ -130,10 +133,13 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
     if (rb_pop(&free_ring, &d))
     {
         *buff = d.data;
+        note_free_count(rb_count(&free_ring));   /* low-water mark */
     }
     else
     {
         *buff = NULL;                    /* pool empty: all buffers are busy */
+        pool_empty_total++;
+        note_free_count(0u);
     }
 }
 
@@ -150,6 +156,35 @@ static uint32_t fifo_overflow_total;     /* main loop only */
 static uint32_t dma_missed_total;        /* main loop only */
 static volatile uint32_t rbu_total;      /* written by the ETH ISR */
 static uint32_t refill_total;            /* main loop only */
+
+/* Low-water marks of the free ring. Written where buffers are TAKEN
+ * (HAL_ETH_RxAllocateCallback: ETH ISR, or main with the ETH IRQ masked),
+ * because that is the only place the count goes down. */
+static volatile uint32_t free_low_ever   = ETH_RX_BUF_COUNT;
+static volatile uint32_t free_low_period = ETH_RX_BUF_COUNT;
+
+static void note_free_count(uint32_t n)
+{
+    if (n < free_low_ever)
+    {
+        free_low_ever = n;
+    }
+    if (n < free_low_period)
+    {
+        free_low_period = n;
+    }
+}
+
+uint32_t eth_rx_take_period_low(void)
+{
+    /* Read and restart together, so a buffer taken by the ISR in between is
+     * not lost: mask the ETH IRQ for these few instructions. */
+    HAL_NVIC_DisableIRQ(ETH_IRQn);
+    uint32_t low    = free_low_period;
+    free_low_period = rb_count(&free_ring);
+    HAL_NVIC_EnableIRQ(ETH_IRQn);
+    return low;
+}
 
 void eth_rx_refill(void)
 {
@@ -206,6 +241,8 @@ void eth_rx_get_stats(eth_rx_stats_t *out)
     out->rbu_events    = rbu_total;
     out->refills       = refill_total;
     out->free_bufs     = rb_count(&free_ring);
+    out->free_low      = free_low_ever;
+    out->pool_empty    = pool_empty_total;
 }
 
 void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t Length)
