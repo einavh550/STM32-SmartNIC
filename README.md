@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame, GPIO pulse for the logic analyzer |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -203,6 +203,12 @@ tests check exactly this table. Default deny: anything not listed is dropped.
   (and avg in ns), then the numbers restart.
 - `max` can include an Ethernet interrupt that arrived during the
   measurement; `min` and `avg` are the filter's own cost.
+- Cross-check from outside: `PERF_PIN` (PA5, header pin D13, set up in
+  CubeMX, very high speed) is HIGH while `pkt_filter_process()` runs. The pin
+  is written through `BSRR` (one store) so the edges add almost nothing.
+  `tools/la/pulse_width.py` captures it with a logic analyzer (sigrok-cli) and
+  prints min / avg / max pulse width. It matches the DWT number (see
+  Performance).
 
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
@@ -312,6 +318,65 @@ RX frame: 110 bytes
   before anti-spoofing and scan detection),
   and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
+- **Per-frame log switch:** log ON, `normal --count 10` printed 10 `RX` lines
+  and `passed 10`; after one USER button press (`Per-frame log OFF`, yellow LED
+  off) the same command printed no `RX` lines and the stats went to
+  `passed 20`. The filter keeps running and counting with the log off.
+
+## Performance
+
+### Filter cost per frame: two independent measurements
+
+The time `pkt_filter_process()` takes for one frame (parse + every filter
+stage + counter update) was measured two ways at once:
+
+1. **DWT cycle counter (inside):** the CPU counts its own clock cycles around
+   the call (`perf.[ch]`, overhead of 13 cycles measured at boot and
+   subtracted). Printed every 5 s in the stats line.
+2. **GPIO pulse + logic analyzer (outside):** `PERF_PIN` (PA5, D13) is HIGH
+   during the same call. A logic analyzer with its own clock measures the
+   pulse (`tools/la/pulse_width.py`). It does not rely on anything the chip
+   reports, so it checks both the DWT code and that the CPU really runs at
+   550 MHz (the DWT -> ns conversion assumes it).
+
+**Setup:** Debug build (`-O0`), core at 550 MHz, I-Cache + D-Cache on,
+per-frame log OFF. Traffic: `nic_test.py normal` from the BBB (60-byte UDP
+frames to port 5000, 10 per second), so every frame walks the full pipeline
+and passes on the `udp-test` rule. Each run used a different `--count`, so
+the matching stats line (`(N frames)`, `passed` +N) proves which run it was.
+Analyzer: fx2lafw (Saleae-compatible clone), sigrok-cli in WSL2, GND + CH1 on
+D13.
+
+| Run | Frames | DWT min / avg / max (cycles) | DWT avg | Analyzer rate | Pulses | Analyzer min / avg / max | Analyzer avg (cycles) | Difference |
+|-----|--------|------------------------------|---------|---------------|--------|--------------------------|-----------------------|------------|
+| A   | 7      | 1837 / 1865 / 1904           | 3.39 us | 12 MHz (83 ns)  | 7 | 3.250 / 3.333 / 3.417 us | 1833 (+/- 46) | 32 cycles |
+| B   | 5      | 1837 / 1837 / 1838           | 3.34 us | 12 MHz (83 ns)  | 5 | 3.250 / 3.283 / 3.333 us | 1806 (+/- 46) | 31 cycles |
+| C   | 9      | 1837 / 1873 / 1904           | 3.41 us | 24 MHz (42 ns)  | 9 | 3.250 / 3.338 / 3.417 us | 1836 (+/- 23) | 37 cycles |
+
+**Result: the filter takes about 1840-1870 cycles = 3.3-3.4 us per frame**
+(Debug build). Earlier runs gave the same: avg 1864 and 1872 cycles.
+
+**Reading the numbers**
+- Pulse count = frame count in every run: every frame was seen by both
+  methods.
+- The two methods agree within about 35 cycles (~60 ns). The pulse is always
+  a little shorter, and by about the same amount, so it is a fixed offset,
+  not noise: the two pin writes (and, at `-O0`, the instructions that load the
+  port address) sit inside the DWT window but outside the pulse.
+- `min` is 1837 cycles in every run: the same frame always costs the same
+  code path. The slower frames (up to 1904, +67 cycles) are most likely cache
+  misses or a SysTick interrupt landing inside the measurement.
+- 3.4 us per frame means the filter alone could handle about 290 000 frames/s.
+  A 100 Mbit/s link carries at most ~148 800 minimum-size frames/s, so the
+  filter is not the bottleneck on paper. The stress test (next) checks the
+  whole path (DMA, interrupt, ring buffers).
+
+**Reproduce:** see `tools/la/pulse_width.py` (wiring and commands in the
+header). Order per run: start the script (it waits for the first pulse), then
+send from the BBB.
+
+**Still to measure:** cost per scenario (early drops such as `malformed`
+vs. a full rule walk), the stress ramp (drop point), and an optimised build.
 
 ## BBB test link
 
@@ -390,6 +455,7 @@ Core/Inc, Core/Src
   filter_policy.[ch]     the rule table the board runs (BBB link)
   main.c                 init sequence, main loop, rule table and counters
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
+tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
 tests/                   host unit tests (parser, filter) + Makefile
 .github/workflows/       CI: runs the host tests on every push
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA

@@ -235,8 +235,15 @@ int main(void)
        * before the timer starts so only the filter itself is measured. */
       uint32_t now_ms = HAL_GetTick();
       uint32_t t0 = perf_now();
+      /* PERF_PIN (PA5, D13) is HIGH while the filter runs: a logic analyzer
+       * measures the pulse width from outside, to cross-check the DWT number.
+       * BSRR is written directly (one store, set = low 16 bits, reset = high
+       * 16 bits) instead of HAL_GPIO_WritePin(), so the pin edges add almost
+       * nothing to what is measured. */
+      PERF_PIN_GPIO_Port->BSRR = PERF_PIN_Pin;
       pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
                                            now_ms, &hdr);
+      PERF_PIN_GPIO_Port->BSRR = (uint32_t)PERF_PIN_Pin << 16;
       perf_record(&filter_cycles, perf_now() - t0);
 
       if (log_frames != 0u)
@@ -374,6 +381,7 @@ static void MX_ETH_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -383,6 +391,16 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(PERF_PIN_GPIO_Port, PERF_PIN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PERF_PIN_Pin */
+  GPIO_InitStruct.Pin = PERF_PIN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(PERF_PIN_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
