@@ -225,28 +225,28 @@ static void test_process_verdicts(void)
 
     /* PASS by a rule: reason NONE. */
     len = build_eth(frame, ETHERTYPE_ARP);
-    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
     CHECK_EQ(v.reason, DROP_REASON_NONE);
     CHECK_EQ(v.rule_idx, 1);
 
     /* DROP by a rule. */
     len = build_udp(frame, 1u, 2u, 137u, 137u);
-    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_RULE);
     CHECK_EQ(v.rule_idx, 0);
 
     /* DROP by the default. */
     len = build_tcp(frame, 1u, 2u, 40000u, 80u);
-    v   = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v   = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_DEFAULT);
     CHECK_EQ(v.rule_idx, -1);
 
     /* DROP as malformed: UDP to port 67 would PASS, but the header is cut. */
     len = build_udp(frame, 1u, 2u, 68u, 67u);
-    v   = pkt_filter_process(&f, frame, len - 1u, 0u, &hdr);
+    v   = pkt_filter_process(&f, frame, len - 1u, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_MALFORMED);
     CHECK_EQ(v.rule_idx, -1);
@@ -261,15 +261,15 @@ static void test_process_counters(void)
     CHECK(pkt_filter_init(&f, demo_rules, 3u, PKT_DROP));
 
     len = build_udp(frame, 1u, 2u, 137u, 137u);       /* r0 DROP   */
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     len = build_eth(frame, ETHERTYPE_ARP);            /* r1 PASS   */
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     len = build_udp(frame, 0u, 0xFFFFFFFFu, 68u, 67u);/* r2 PASS   */
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     len = build_tcp(frame, 1u, 2u, 40000u, 80u);      /* default   */
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
-    (void)pkt_filter_process(&f, frame, 10u, 0u, &hdr);   /* malformed */
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, 10u, 0u, 0u, &hdr);   /* malformed */
 
     CHECK_EQ(f.passed, 2u);
     CHECK_EQ(f.dropped[DROP_REASON_RULE], 2u);
@@ -294,15 +294,94 @@ static void test_malformed_never_reaches_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
     frame[ETH_HDR_LEN] = 0x44;                        /* IHL 4: impossible */
 
-    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_MALFORMED);
     CHECK_EQ(f.rule_hits[0], 0u);
 }
 
+/* ------------------------------------------------------------------------- */
+/* MAC checksum offload report (hw_flags)                                    */
+/* ------------------------------------------------------------------------- */
+
+static void test_bad_checksum_drops_valid_frame(void)
+{
+    /* A perfectly parsable frame that a catch-all rule would PASS: only the
+     * MAC's report can tell it is corrupted. Both error bits count. */
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    pkt_verdict_t v;
+    uint16_t      len = build_udp(frame, IP4(192, 168, 10, 2), IP4(192, 168, 10, 1), 40000u, 5000u);
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
+
+    v = pkt_filter_process(&f, frame, len, PKT_FLAG_IP_HDR_ERR, 0u, &hdr);
+    CHECK_EQ(v.action, PKT_DROP);
+    CHECK_EQ(v.reason, DROP_REASON_BAD_CHECKSUM);
+    CHECK_EQ(v.rule_idx, -1);
+
+    v = pkt_filter_process(&f, frame, len, PKT_FLAG_IP_PAYLOAD_ERR, 0u, &hdr);
+    CHECK_EQ(v.reason, DROP_REASON_BAD_CHECKSUM);
+
+    v = pkt_filter_process(&f, frame, len, PKT_FLAG_CSUM_ERRORS, 0u, &hdr);
+    CHECK_EQ(v.reason, DROP_REASON_BAD_CHECKSUM);
+
+    /* The same frame without a report passes: the flag alone decided. */
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).action, PKT_PASS);
+
+    CHECK_EQ(f.dropped[DROP_REASON_BAD_CHECKSUM], 3u);
+    CHECK_EQ(f.passed, 1u);
+    CHECK_EQ(f.rule_hits[0], 1u);                     /* bad frames never reach rules */
+    CHECK_EQ(f.default_hits, 0u);
+}
+
+static void test_malformed_wins_over_bad_checksum(void)
+{
+    /* Broken header AND a MAC report (what the board sees for IHL 4):
+     * the parser's answer is the more precise one. */
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    uint16_t      len = build_udp(frame, 1u, 2u, 1u, 2u);
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
+    frame[ETH_HDR_LEN] = 0x44;                        /* IHL 4: impossible */
+
+    CHECK_EQ(pkt_filter_process(&f, frame, len, PKT_FLAG_IP_HDR_ERR, 0u, &hdr).reason,
+             DROP_REASON_MALFORMED);
+    CHECK_EQ(f.dropped[DROP_REASON_MALFORMED], 1u);
+    CHECK_EQ(f.dropped[DROP_REASON_BAD_CHECKSUM], 0u);
+}
+
+static void test_bad_checksum_before_spoof_and_scan(void)
+{
+    /* Corrupted bytes: the addresses and flags may be the corrupted part,
+     * so later stages must not judge them. */
+    const pkt_rule_t pass_all[] = { { .match = 0u, .action = PKT_PASS } };
+    pkt_filter_t  f;
+    pkt_hdr_t     hdr;
+    uint16_t      len;
+
+    CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
+
+    len = build_udp(frame, IP4(127, 0, 0, 1), IP4(192, 168, 10, 1), 1u, 2u);   /* spoofed */
+    CHECK_EQ(pkt_filter_process(&f, frame, len, PKT_FLAG_IP_PAYLOAD_ERR, 0u, &hdr).reason,
+             DROP_REASON_BAD_CHECKSUM);
+
+    len = build_tcp(frame, IP4(192, 168, 10, 2), IP4(192, 168, 10, 1), 40001u, 80u);
+    set_tcp_flags(frame, 0u);                                                   /* NULL scan */
+    CHECK_EQ(pkt_filter_process(&f, frame, len, PKT_FLAG_IP_PAYLOAD_ERR, 0u, &hdr).reason,
+             DROP_REASON_BAD_CHECKSUM);
+
+    CHECK_EQ(f.dropped[DROP_REASON_SPOOFED], 0u);
+    CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 0u);
+}
+
 static void test_reason_names(void)
 {
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_MALFORMED), "malformed") == 0);
+    CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_BAD_CHECKSUM), "bad-checksum") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_SPOOFED), "spoofed") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_TCP_SCAN), "tcp-scan") == 0);
     CHECK(strcmp(pkt_drop_reason_name(DROP_REASON_RATE_LIMIT), "rate-limit") == 0);
@@ -353,16 +432,16 @@ static void test_scan_is_dropped_before_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
 
     set_tcp_flags(frame, TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_URG);  /* XMAS */
-    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_TCP_SCAN);
     CHECK_EQ(v.rule_idx, -1);
 
     set_tcp_flags(frame, 0u);                                          /* NULL */
-    (void)pkt_filter_process(&f, frame, len, 0u, &hdr);
+    (void)pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
 
     set_tcp_flags(frame, TCP_FLAG_SYN);                                /* real */
-    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
 
     CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 2u);
@@ -379,7 +458,7 @@ static void test_udp_is_not_checked_for_flags(void)
     uint16_t     len = build_udp(frame, 1u, 2u, 1u, 2u);
 
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_DROP));
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).action, PKT_PASS);
 }
 
 static void test_rule_on_tcp_flags(void)
@@ -489,7 +568,7 @@ static void test_spoofed_is_dropped_before_rules(void)
     CHECK(pkt_filter_init(&f, pass_all, 1u, PKT_PASS));
 
     len = build_udp(frame, IP4(127, 0, 0, 1), IP4(192, 168, 7, 1), 1u, 2u);
-    v = pkt_filter_process(&f, frame, len, 0u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 0u, &hdr);
     CHECK_EQ(v.action, PKT_DROP);
     CHECK_EQ(v.reason, DROP_REASON_SPOOFED);
     CHECK_EQ(v.rule_idx, -1);
@@ -497,7 +576,7 @@ static void test_spoofed_is_dropped_before_rules(void)
     /* Spoofed AND a scan: the earlier stage (spoofing) gets the blame. */
     len = build_tcp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 1), 80u, 80u);
     set_tcp_flags(frame, 0u);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).reason, DROP_REASON_SPOOFED);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).reason, DROP_REASON_SPOOFED);
 
     CHECK_EQ(f.dropped[DROP_REASON_SPOOFED], 2u);
     CHECK_EQ(f.dropped[DROP_REASON_TCP_SCAN], 0u);
@@ -594,7 +673,7 @@ static void test_syn_flood_is_rate_limited(void)
     /* Flood: 10 SYNs in the same millisecond. */
     for (uint32_t i = 0u; i < 10u; i++)
     {
-        v = pkt_filter_process(&f, frame, len, 1000u, &hdr);
+        v = pkt_filter_process(&f, frame, len, 0u, 1000u, &hdr);
         CHECK_EQ(v.rule_idx, 0);
     }
     CHECK_EQ(f.passed, 3u);                                  /* the burst      */
@@ -603,13 +682,13 @@ static void test_syn_flood_is_rate_limited(void)
 
     /* Data packets (ACK) of open connections are not slowed down. */
     set_tcp_flags(frame, TCP_FLAG_ACK);
-    v = pkt_filter_process(&f, frame, len, 1000u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 1000u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
     CHECK_EQ(v.rule_idx, 1);
 
     /* 100 ms later one new connection may start again. */
     set_tcp_flags(frame, TCP_FLAG_SYN);
-    v = pkt_filter_process(&f, frame, len, 1100u, &hdr);
+    v = pkt_filter_process(&f, frame, len, 0u, 1100u, &hdr);
     CHECK_EQ(v.action, PKT_PASS);
     CHECK_EQ(v.reason, DROP_REASON_NONE);
 }
@@ -628,11 +707,11 @@ static void test_each_rule_has_its_own_bucket(void)
     CHECK(pkt_filter_init(&f, rules, 2u, PKT_DROP));
 
     len = build_udp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 5u, 1000u);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_DROP);   /* r0 empty */
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).action, PKT_PASS);
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).action, PKT_DROP);   /* r0 empty */
 
     len = build_udp(frame, IP4(10, 0, 0, 1), IP4(10, 0, 0, 2), 5u, 2000u);
-    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, &hdr).action, PKT_PASS);   /* r1 full  */
+    CHECK_EQ(pkt_filter_process(&f, frame, len, 0u, 0u, &hdr).action, PKT_PASS);   /* r1 full  */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -656,6 +735,9 @@ void run_pkt_filter_tests(void)
     RUN_TEST(test_process_verdicts);
     RUN_TEST(test_process_counters);
     RUN_TEST(test_malformed_never_reaches_rules);
+    RUN_TEST(test_bad_checksum_drops_valid_frame);
+    RUN_TEST(test_malformed_wins_over_bad_checksum);
+    RUN_TEST(test_bad_checksum_before_spoof_and_scan);
     RUN_TEST(test_reason_names);
 
     RUN_TEST(test_tcp_flags_real_traffic_is_valid);

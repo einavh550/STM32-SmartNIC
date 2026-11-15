@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "pkt_parse.h"
+#include "pkt_flags.h"
 
 /* ------------------------------------------------------------------------- */
 /* Configuration                                                             */
@@ -94,6 +95,8 @@ typedef enum
 {
     DROP_REASON_NONE = 0,       /**< Not dropped: the frame passed.               */
     DROP_REASON_MALFORMED,      /**< A header the frame claims to have is broken. */
+    DROP_REASON_BAD_CHECKSUM,   /**< Headers look valid, but the MAC's checksum
+                                     offload says the bytes are corrupted.        */
     DROP_REASON_SPOOFED,        /**< Source address that cannot be real.          */
     DROP_REASON_TCP_SCAN,      /**< TCP flag combination no real stack sends.    */
     DROP_REASON_RATE_LIMIT,     /**< A PKT_RATE_LIMIT rule's bucket was empty.    */
@@ -158,14 +161,19 @@ bool pkt_filter_init(pkt_filter_t *f, const pkt_rule_t *rules, uint32_t count,
                      pkt_action_t default_action);
 
 /**
- * @brief  Full pipeline for one frame: sanity (malformed) -> anti-spoofing ->
- *         TCP scan check -> rule table. Updates the filter's counters.
- * @param  now_ms  Current time in ms (HAL_GetTick() on the board), for the
- *                 rate limiter. Wrap-around at 2^32 is handled.
- * @param  hdr     Filled with the parsed headers (useful for logging).
+ * @brief  Full pipeline for one frame: sanity (malformed, then bad checksum)
+ *         -> anti-spoofing -> TCP scan check -> rule table. Updates the
+ *         filter's counters.
+ * @param  hw_flags  PKT_FLAG_* bits the MAC reported for this frame
+ *                   (pkt_desc_t.flags), 0 if none. When the parser also finds
+ *                   the frame broken, "malformed" wins: it is more specific
+ *                   and does not depend on the hardware.
+ * @param  now_ms    Current time in ms (HAL_GetTick() on the board), for the
+ *                   rate limiter. Wrap-around at 2^32 is handled.
+ * @param  hdr       Filled with the parsed headers (useful for logging).
  */
 pkt_verdict_t pkt_filter_process(pkt_filter_t *f, const uint8_t *frame, uint16_t len,
-                                 uint32_t now_ms, pkt_hdr_t *hdr);
+                                 uint16_t hw_flags, uint32_t now_ms, pkt_hdr_t *hdr);
 
 /**
  * @brief  Token bucket: refill for the time since the last call, then try to

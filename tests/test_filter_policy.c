@@ -24,7 +24,7 @@ static void setup(void)
 
 static pkt_verdict_t send(uint16_t len, uint32_t now_ms)
 {
-    return pkt_filter_process(&f, frame, len, now_ms, &hdr);
+    return pkt_filter_process(&f, frame, len, 0u, now_ms, &hdr);
 }
 
 /* ------------------------------------------------------------------------- */

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include "pkt_flags.h"   /* PKT_FLAG_* values of pkt_desc_t.flags */
 
 /* ------------------------------------------------------------------------- */
 /* Configuration                                                             */
@@ -46,7 +47,7 @@ typedef struct
 {
     uint8_t  *data;   /**< Start of the frame in a DMA-capable RX buffer.         */
     uint16_t  len;    /**< Frame length in bytes (max 1518 fits in 16 bits).      */
-    uint16_t  flags;  /**< Status bits from the ETH DMA (e.g. CRC error), Phase 2. */
+    uint16_t  flags;  /**< PKT_FLAG_* status bits reported by the ETH MAC/DMA.    */
 } pkt_desc_t;
 
 /**

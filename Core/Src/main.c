@@ -27,6 +27,8 @@
 #include "pkt_parse.h"
 #include "pkt_filter.h"
 #include "filter_policy.h"
+#include "perf.h"
+#include "uart_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,6 +39,11 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
+#define BUTTON_DEBOUNCE_MS (200u)   /* ignore button bounces closer than this */
+/* CPU headroom test: fake work added to every frame, in CPU cycles.
+ * 0 = normal firmware. Raise it step by step at line rate until frames
+ * are lost: the last value with zero loss = cycles still free per frame. */
+#define EXTRA_CYCLES       (0u)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,6 +78,35 @@ ETH_HandleTypeDef heth;
 /* USER CODE BEGIN PV */
 /* Rule table (filter_policy.c) + counters. Used only by the main loop. */
 static pkt_filter_t filter;
+
+/* Per-frame log switch. printf at 115200 costs ~7 ms per line, far more than
+ * the filter itself, so it must be off when measuring. The USER button toggles
+ * it at runtime; the stats line every STATS_PERIOD_MS is always printed.
+ * The ISR only raises a flag; the main loop does the toggle and the printing. */
+static volatile uint8_t button_pressed;   /* set by the button ISR, cleared by main */
+static uint8_t log_frames = 1u;           /* 1 = print one line per frame (yellow LED on) */
+
+/* CPU cycles spent in pkt_filter_process() per frame (parse + all filter
+ * stages), collected over one stats period and printed with the stats. */
+static perf_stats_t filter_cycles;
+
+/* The same cost split by the path the frame took through the filter, since
+ * boot (never reset), so each scenario's frame types can be told apart:
+ *   path_reason[r]  dropped before any rule matched (malformed, bad-checksum,
+ *                   spoofed, tcp-scan) or by the default action
+ *   path_pass[i]    matched rule i and passed
+ *   path_limit[i]   matched rule i and was dropped by its rate limit       */
+static perf_stats_t path_reason[DROP_REASON_COUNT];
+static perf_stats_t path_pass[POLICY_RULE_COUNT];
+static perf_stats_t path_limit[POLICY_RULE_COUNT];
+
+/* Whole cost per frame = ETH ISR time + main-loop RX work (pop, filter,
+ * free, refill), summed over one stats period. The main-loop part has the
+ * ISR time that interrupted it taken out, so nothing is counted twice. */
+static uint64_t main_rx_cycles;    /* main-loop RX work, ISR time removed */
+static uint32_t main_rx_frames;    /* frames handled in this period */
+static uint32_t isr_cycles_mark;   /* perf_eth_isr_cycles at period start */
+static uint32_t period_start_ms;   /* HAL_GetTick() at period start */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -79,13 +115,38 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ETH_Init(void);
 /* USER CODE BEGIN PFP */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v);
+static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v);
 static void print_stats(void);
+static void handle_button(void);
+static void record_path(pkt_verdict_t v, uint32_t cycles);
+static void print_paths(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Burn exactly 'cycles' CPU cycles (headroom test). Spins on the DWT counter
+ * instead of a for-loop count, so the delay stays the same at any -O level. */
+static void burn_cycles(uint32_t cycles)
+{
+  uint32_t start = perf_now();
+  while ((perf_now() - start) < cycles)
+  {
+  }
+}
 
+/* Read the cycle counter and the ETH ISR total as one consistent pair.
+ * If the ISR fires between the two reads, the pair would not match (ISR
+ * time counted on one side only), so read again until no ISR got in. */
+static void time_snapshot(uint32_t *now, uint32_t *isr)
+{
+  uint32_t before;
+  do
+  {
+    before = perf_eth_isr_cycles;
+    *now   = perf_now();
+    *isr   = perf_eth_isr_cycles;
+  } while (*isr != before);
+}
 /* USER CODE END 0 */
 
 /**
@@ -154,6 +215,10 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* From here printf only queues text; the USART3 interrupt sends it
+   * (uart_log.c). COM1 (USART3) was just set up by BSP_COM_Init() above. */
+  uart_log_init();
+
 #ifdef RB_SELF_TEST
   BSP_LED_On((rb_self_test() == 0u) ? LED_GREEN : LED_RED);
 #endif
@@ -169,6 +234,24 @@ int main(void)
     Error_Handler();
   }
 
+  /* Checksum offload: the MAC checks every IPv4 header and TCP/UDP checksum
+   * in hardware and reports the result in the RX descriptor. The HAL default
+   * (DropTCPIPChecksumErrorPacket = ENABLE) also DROPS the failing frames
+   * inside the MAC, before the DMA, without any counter: the firmware never
+   * learns they existed. Forward them instead; eth_rx.c passes the MAC's
+   * report on with each frame and the filter drops and counts them as
+   * "bad-checksum". The MAC config can only change before HAL_ETH_Start_IT(). */
+  {
+    ETH_MACConfigTypeDef mac_cfg;
+    HAL_ETH_GetMACConfig(&heth, &mac_cfg);
+    mac_cfg.DropTCPIPChecksumErrorPacket = DISABLE;
+    if (HAL_ETH_SetMACConfig(&heth, &mac_cfg) != HAL_OK)
+    {
+      printf("ETH MAC config failed\r\n");
+      Error_Handler();
+    }
+  }
+
   eth_rx_init();
   if (HAL_ETH_Start_IT(&heth) != HAL_OK)
   {
@@ -176,6 +259,24 @@ int main(void)
     Error_Handler();
   }
   printf("ETH RX started\r\n");
+  /* Read back from the RCC registers: proves the PLL really runs (550 MHz). */
+  printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
+  perf_init();
+  perf_reset(&filter_cycles);
+  for (uint32_t i = 0u; i < DROP_REASON_COUNT; i++)
+  {
+    perf_reset(&path_reason[i]);
+  }
+  for (uint32_t i = 0u; i < POLICY_RULE_COUNT; i++)
+  {
+    perf_reset(&path_pass[i]);
+    perf_reset(&path_limit[i]);
+  }
+  printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
+         (unsigned long)perf_overhead());
+  printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
+  printf("Per-frame log ON (USER button toggles)\r\n");
+  BSP_LED_On(LED_YELLOW);
 
   while (1)
   {
@@ -187,17 +288,66 @@ int main(void)
     pkt_desc_t pkt;
     pkt_hdr_t  hdr;
 
+    /* Start of the main-loop RX work (whole-cost measurement). */
+    uint32_t work_t0, work_isr;
+    time_snapshot(&work_t0, &work_isr);
+    uint32_t frames_now = 0u;   /* frames handled in this loop pass */
+
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
-      /* Parse, drop if malformed, else run the rules. Counters are updated inside. */
-      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, HAL_GetTick(), &hdr);
+      frames_now++;
+      /* Parse, drop if malformed or the MAC reported a checksum error, else
+       * run the rules. Counters are updated inside. HAL_GetTick() is read
+       * before the timer starts so only the filter itself is measured. */
+      uint32_t now_ms = HAL_GetTick();
+      uint32_t t0 = perf_now();
+      /* PERF_PIN (PA5, D13) is HIGH while the filter runs: a logic analyzer
+       * measures the pulse width from outside, to cross-check the DWT number.
+       * BSRR is written directly (one store, set = low 16 bits, reset = high
+       * 16 bits) instead of HAL_GPIO_WritePin(), so the pin edges add almost
+       * nothing to what is measured. */
+      PERF_PIN_GPIO_Port->BSRR = PERF_PIN_Pin;
+      pkt_verdict_t v = pkt_filter_process(&filter, pkt.data, pkt.len, pkt.flags,
+                                           now_ms, &hdr);
+      PERF_PIN_GPIO_Port->BSRR = (uint32_t)PERF_PIN_Pin << 16;
+      uint32_t cycles = perf_now() - t0;
+      perf_record(&filter_cycles, cycles);
+      record_path(v, cycles);
+      /* Headroom test: pretend the filter is heavier. Outside the DWT window
+       * so the filter numbers stay clean; before the buffer is freed, like
+       * real extra work would be. */
+      if (EXTRA_CYCLES != 0u)
+      {
+        burn_cycles(EXTRA_CYCLES);
+      }
 
-      log_frame(pkt.len, &hdr, v);
+      if (log_frames != 0u)
+      {
+        log_frame(&pkt, &hdr, v);
+      }
 
       /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
       eth_rx_buf_free(pkt.data);
     }
+
+    /* Buffers were just freed: hand them to any RX descriptor left without
+     * one, and wake the DMA if it stopped (see eth_rx_refill()). */
+    eth_rx_refill();
+
+    /* End of the RX work: elapsed time minus the ISR time that cut into it.
+     * Only passes that handled frames count: an empty pass is idle polling
+     * (the CPU waiting for work), not a cost of any frame. */
+    uint32_t work_t1, work_isr1;
+    time_snapshot(&work_t1, &work_isr1);
+    if (frames_now != 0u)
+    {
+      main_rx_cycles += (work_t1 - work_t0) - (work_isr1 - work_isr);
+      main_rx_frames += frames_now;
+    }
+
+    handle_button();
+    eth_rx_poll_hw();   /* collect the MAC's clear-on-read drop counters */
 
     /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
     if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
@@ -224,7 +374,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
@@ -233,7 +383,16 @@ void SystemClock_Config(void)
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 275;
+  RCC_OscInitStruct.PLL.PLLP = 1;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_1;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -244,7 +403,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
@@ -252,7 +411,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -314,6 +473,7 @@ static void MX_ETH_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -324,16 +484,65 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(PERF_PIN_GPIO_Port, PERF_PIN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PERF_PIN_Pin */
+  GPIO_InitStruct.Pin = PERF_PIN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(PERF_PIN_GPIO_Port, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-/** Print one line per frame: what it is and what the filter decided. */
-static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
+/** USER button ISR (overrides the weak BSP version). Keep it tiny: just a flag. */
+void BSP_PB_Callback(Button_TypeDef Button)
 {
-  printf("RX %4u  ", (unsigned)len);
+  if (Button == BUTTON_USER)
+  {
+    button_pressed = 1u;
+  }
+}
+
+/** Main-loop side of the button: debounce, flip the log switch, report it. */
+static void handle_button(void)
+{
+  static uint32_t last_press_ms;
+
+  if (button_pressed == 0u)
+  {
+    return;
+  }
+  button_pressed = 0u;
+
+  /* A mechanical button bounces: one press can fire several interrupts. */
+  if ((HAL_GetTick() - last_press_ms) < BUTTON_DEBOUNCE_MS)
+  {
+    return;
+  }
+  last_press_ms = HAL_GetTick();
+
+  log_frames ^= 1u;
+  if (log_frames != 0u)
+  {
+    BSP_LED_On(LED_YELLOW);
+  }
+  else
+  {
+    BSP_LED_Off(LED_YELLOW);
+  }
+  printf("Per-frame log %s\r\n", (log_frames != 0u) ? "ON" : "OFF");
+}
+
+/** Print one line per frame: what it is and what the filter decided. */
+static void log_frame(const pkt_desc_t *pkt, const pkt_hdr_t *hdr, pkt_verdict_t v)
+{
+  printf("RX %4u  ", (unsigned)pkt->len);
 
   if ((hdr->valid & PKT_HAS_IPV4) != 0u)
   {
@@ -363,6 +572,16 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
     printf("too short");
   }
 
+  /* The MAC's checksum offload report (eth_rx.c), if it found an error. */
+  if ((pkt->flags & PKT_FLAG_IP_HDR_ERR) != 0u)
+  {
+    printf("  [hw: ip-hdr]");
+  }
+  if ((pkt->flags & PKT_FLAG_IP_PAYLOAD_ERR) != 0u)
+  {
+    printf("  [hw: payload]");
+  }
+
   const char *verdict = (v.action == PKT_PASS) ? "PASS" : "DROP";
 
   if (v.rule_idx >= 0)
@@ -377,7 +596,7 @@ static void log_frame(uint16_t len, const pkt_hdr_t *hdr, pkt_verdict_t v)
   }
   else
   {
-    /* malformed, spoofed, tcp-scan or default */
+    /* malformed, bad-checksum, spoofed, tcp-scan or default */
     printf("  => %s (%s)\r\n", verdict, pkt_drop_reason_name(v.reason));
   }
 }
@@ -399,6 +618,108 @@ static void print_stats(void)
   }
 
   printf(" default:%lu ---\r\n", (unsigned long)filter.default_hits);
+
+  /* Hardware view: frames the MAC took off the wire vs. frames the filter
+   * saw. MAC counts unicast only, so broadcasts (DHCP) appear only in "seen". */
+  eth_rx_stats_t hw;
+  eth_rx_get_stats(&hw);
+  uint32_t seen = filter.passed;
+  for (uint32_t r = 0u; r < DROP_REASON_COUNT; r++)
+  {
+    seen += filter.dropped[r];
+  }
+  printf("--- hw: mac rx unicast %lu | filter saw %lu | fifo-overflow %lu"
+         " dma-missed %lu | rbu %lu refills %lu | free bufs %lu/%u"
+         " (low: period %lu, ever %lu, empty %lu) | log-drop %lu ---\r\n",
+         (unsigned long)hw.mac_rx_good, (unsigned long)seen,
+         (unsigned long)hw.fifo_overflow, (unsigned long)hw.dma_missed,
+         (unsigned long)hw.rbu_events, (unsigned long)hw.refills,
+         (unsigned long)hw.free_bufs,
+         (unsigned)ETH_RX_BUF_COUNT, (unsigned long)eth_rx_take_period_low(),
+         (unsigned long)hw.free_low, (unsigned long)hw.pool_empty,
+         (unsigned long)uart_log_dropped());
+
+  /* Filter cost per frame over the last period, then start a new period. */
+  if (filter_cycles.count == 0u)
+  {
+    printf("--- filter cycles: no frames ---\r\n");
+  }
+  else
+  {
+    uint32_t avg = (uint32_t)(filter_cycles.sum / filter_cycles.count);
+    printf("--- filter cycles/frame (%lu frames): min %lu avg %lu max %lu"
+           " = avg %lu ns ---\r\n",
+           (unsigned long)filter_cycles.count, (unsigned long)filter_cycles.min,
+           (unsigned long)avg, (unsigned long)filter_cycles.max,
+           (unsigned long)perf_cycles_to_ns(avg));
+    print_paths();   /* only when something new arrived, to keep the log short */
+  }
+  perf_reset(&filter_cycles);
+
+  /* Whole cost per frame (ISR + main loop) and how busy the CPU was. */
+  uint32_t now_ms     = HAL_GetTick();
+  uint32_t isr_now    = perf_eth_isr_cycles;
+  uint64_t isr_cycles = (uint32_t)(isr_now - isr_cycles_mark);
+  uint64_t period_cycles = (uint64_t)(now_ms - period_start_ms) * (SystemCoreClock / 1000u);
+  if ((main_rx_frames != 0u) && (period_cycles != 0u))
+  {
+    uint32_t isr_pf  = (uint32_t)(isr_cycles / main_rx_frames);
+    uint32_t main_pf = (uint32_t)(main_rx_cycles / main_rx_frames);
+    uint32_t busy_pct = (uint32_t)(((isr_cycles + main_rx_cycles) * 100u) / period_cycles);
+    printf("--- whole cost/frame (%lu frames): isr %lu + main %lu = %lu cycles"
+           " | cpu busy on rx %lu%% ---\r\n",
+           (unsigned long)main_rx_frames, (unsigned long)isr_pf,
+           (unsigned long)main_pf, (unsigned long)(isr_pf + main_pf),
+           (unsigned long)busy_pct);
+  }
+  main_rx_cycles  = 0u;
+  main_rx_frames  = 0u;
+  isr_cycles_mark = isr_now;
+  period_start_ms = now_ms;
+}
+
+/** Add one frame's cost to the stats of the path it took. */
+static void record_path(pkt_verdict_t v, uint32_t cycles)
+{
+  if ((v.rule_idx >= 0) && (v.rule_idx < (int32_t)POLICY_RULE_COUNT))
+  {
+    perf_record((v.reason == DROP_REASON_RATE_LIMIT) ? &path_limit[v.rule_idx]
+                                                     : &path_pass[v.rule_idx],
+                cycles);
+  }
+  else if ((uint32_t)v.reason < DROP_REASON_COUNT)
+  {
+    perf_record(&path_reason[v.reason], cycles);
+  }
+}
+
+static void print_one_path(const char *name, const char *suffix, const perf_stats_t *s)
+{
+  if (s->count == 0u)
+  {
+    return;
+  }
+  uint32_t avg = (uint32_t)(s->sum / s->count);
+  printf("    path %-12s%-12s n=%-5lu min %5lu avg %5lu max %5lu cycles = avg %5lu ns\r\n",
+         name, suffix, (unsigned long)s->count, (unsigned long)s->min,
+         (unsigned long)avg, (unsigned long)s->max,
+         (unsigned long)perf_cycles_to_ns(avg));
+}
+
+/** Cycles per frame for every path seen since boot. */
+static void print_paths(void)
+{
+  printf("--- cycles by path (since boot) ---\r\n");
+  for (uint32_t r = 0u; r < DROP_REASON_COUNT; r++)
+  {
+    print_one_path((r == DROP_REASON_NONE) ? "pass" : pkt_drop_reason_name((pkt_drop_reason_t)r),
+                   "", &path_reason[r]);
+  }
+  for (uint32_t i = 0u; i < POLICY_RULE_COUNT; i++)
+  {
+    print_one_path(filter_policy_rule_name((int32_t)i), "pass", &path_pass[i]);
+    print_one_path(filter_policy_rule_name((int32_t)i), "rate-limit", &path_limit[i]);
+  }
 }
 /* USER CODE END 4 */
 
