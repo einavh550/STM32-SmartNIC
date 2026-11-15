@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom) |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -171,6 +171,51 @@ tests check exactly this table. Default deny: anything not listed is dropped.
 - `HAL_ETH_RxCpltCallback` drains every completed descriptor with
   `HAL_ETH_ReadData()` in a loop, so a burst of frames is handled in one interrupt.
 
+**Clock tree (CubeMX)**
+- 8 MHz HSE → PLL1 (÷4 = 2 MHz input, ×275, ÷1) → **550 MHz** SYSCLK / CPU,
+  the maximum for the STM32H723.
+- AXI / AHB (ETH DMA, SRAM) 275 MHz, APB1-4 137.5 MHz: each at its limit.
+- Needs core voltage scale 0 and 3 flash wait states (`FLASH_LATENCY_3`):
+  flash cannot deliver an instruction every cycle at this speed.
+- UART baud rate and the 1 ms SysTick are recomputed by the HAL from the new
+  clocks. The boot log prints `CPU clock: 550 MHz`, read back from the RCC
+  registers.
+
+**Per-frame log switch (USER button)**
+- One log line at 115200 baud takes ~7 ms, thousands of times longer than
+  filtering the frame, so with the log on any timing would measure the UART,
+  not the filter.
+- The blue USER button toggles the per-frame log at runtime (no reflash).
+  The yellow LED is on while the log is on; the board prints
+  `Per-frame log ON` / `OFF`. It starts ON. The stats line every 5 s is always
+  printed.
+- The button interrupt (`BSP_PB_Callback`) only sets a flag; the main loop
+  flips the switch and prints, so no `printf` runs inside an ISR. Presses
+  closer than 200 ms are ignored (contact bounce).
+
+**Cycle measurement (DWT)**
+- The Cortex-M7 DWT unit has a 32-bit counter, `CYCCNT`, that counts CPU
+  clock cycles (1 cycle = 1.82 ns at 550 MHz). `perf.[ch]` starts it at boot
+  and reads it before and after `pkt_filter_process()` (parse + all filter
+  stages) for every frame.
+- The cost of the two reads themselves is measured at boot and subtracted.
+- Every 5 s the stats show min / avg / max cycles per frame for that period
+  (and avg in ns), then the numbers restart.
+- `max` can include an Ethernet interrupt that arrived during the
+  measurement; `min` and `avg` are the filter's own cost.
+- Cross-check from outside: `PERF_PIN` (PA5, header pin D13, set up in
+  CubeMX, very high speed) is HIGH while `pkt_filter_process()` runs. The pin
+  is written through `BSRR` (one store) so the edges add almost nothing.
+  `tools/la/pulse_width.py` captures it with a logic analyzer (sigrok-cli) and
+  prints min / avg / max pulse width and a histogram of widths (frames that
+  take different paths form separate groups). It reads the capture in 1 MB
+  chunks, so long captures fit in memory. It matches the DWT number (see
+  Performance).
+- Per-path stats: each frame's cycles are also added to the stats of its
+  path (drop stage, or matched rule + pass / rate-limit), kept since boot and
+  printed as `--- cycles by path (since boot) ---` after every period that
+  had frames.
+
 **Checksum offload (MAC hardware)**
 - The MAC checks every IPv4 header and TCP/UDP/ICMP checksum in hardware while
   the frame arrives, at no CPU cost, and writes the result into the RX
@@ -279,6 +324,380 @@ RX frame: 110 bytes
   before anti-spoofing and scan detection),
   and the pipeline verdicts and drop-reason counters. GitHub Actions runs them on every push with
   AddressSanitizer + UBSan, so any read past the end of a frame fails the build.
+- **Per-frame log switch:** log ON, `normal --count 10` printed 10 `RX` lines
+  and `passed 10`; after one USER button press (`Per-frame log OFF`, yellow LED
+  off) the same command printed no `RX` lines and the stats went to
+  `passed 20`. The filter keeps running and counting with the log off.
+
+## Performance
+
+### Filter cost per frame: two independent measurements
+
+The time `pkt_filter_process()` takes for one frame (parse + every filter
+stage + counter update) was measured two ways at once:
+
+1. **DWT cycle counter (inside):** the CPU counts its own clock cycles around
+   the call (`perf.[ch]`, overhead of 13 cycles measured at boot and
+   subtracted). Printed every 5 s in the stats line.
+2. **GPIO pulse + logic analyzer (outside):** `PERF_PIN` (PA5, D13) is HIGH
+   during the same call. A logic analyzer with its own clock measures the
+   pulse (`tools/la/pulse_width.py`). It does not rely on anything the chip
+   reports, so it checks both the DWT code and that the CPU really runs at
+   550 MHz (the DWT -> ns conversion assumes it).
+
+**Setup:** Debug build (`-O0`), core at 550 MHz, I-Cache + D-Cache on,
+per-frame log OFF. Traffic: `nic_test.py normal` from the BBB (60-byte UDP
+frames to port 5000, 10 per second), so every frame walks the full pipeline
+and passes on the `udp-test` rule. Each run used a different `--count`, so
+the matching stats line (`(N frames)`, `passed` +N) proves which run it was.
+Analyzer: fx2lafw (Saleae-compatible clone), sigrok-cli in WSL2, GND + CH1 on
+D13.
+
+| Run | Frames | DWT min / avg / max (cycles) | DWT avg | Analyzer rate | Pulses | Analyzer min / avg / max | Analyzer avg (cycles) | Difference |
+|-----|--------|------------------------------|---------|---------------|--------|--------------------------|-----------------------|------------|
+| A   | 7      | 1837 / 1865 / 1904           | 3.39 us | 12 MHz (83 ns)  | 7 | 3.250 / 3.333 / 3.417 us | 1833 (+/- 46) | 32 cycles |
+| B   | 5      | 1837 / 1837 / 1838           | 3.34 us | 12 MHz (83 ns)  | 5 | 3.250 / 3.283 / 3.333 us | 1806 (+/- 46) | 31 cycles |
+| C   | 9      | 1837 / 1873 / 1904           | 3.41 us | 24 MHz (42 ns)  | 9 | 3.250 / 3.338 / 3.417 us | 1836 (+/- 23) | 37 cycles |
+
+**Result: the filter takes about 1840-1870 cycles = 3.3-3.4 us per frame**
+(Debug build). Earlier runs gave the same: avg 1864 and 1872 cycles.
+
+**Reading the numbers**
+- Pulse count = frame count in every run: every frame was seen by both
+  methods.
+- The two methods agree within about 35 cycles (~60 ns). The pulse is always
+  a little shorter, and by about the same amount, so it is a fixed offset,
+  not noise: the two pin writes (and, at `-O0`, the instructions that load the
+  port address) sit inside the DWT window but outside the pulse.
+- `min` is 1837 cycles in every run: the same frame always costs the same
+  code path. The slower frames (up to 1904, +67 cycles) are most likely cache
+  misses or a SysTick interrupt landing inside the measurement.
+- 3.4 us per frame means the filter alone could handle about 290 000 frames/s.
+  A 100 Mbit/s link carries at most ~148 800 minimum-size frames/s, so the
+  filter is not the bottleneck on paper. The stress test (next) checks the
+  whole path (DMA, interrupt, ring buffers).
+
+**Reproduce:** see `tools/la/pulse_width.py` (wiring and commands in the
+header). Order per run: start the script (it waits for the first pulse), then
+send from the BBB.
+
+### Filter cost per path
+
+Every frame's cost is also recorded by the path it took through the filter
+(`--- cycles by path (since boot) ---` block under the stats): which stage
+dropped it, or which rule it matched and whether it passed or hit the rate
+limit. One run of every BBB scenario, same setup as above (Debug `-O0`,
+550 MHz, caches on, log OFF), all on one boot:
+
+| Path (where the verdict is made) | Frames | min / avg / max (cycles) | avg time |
+|----------------------------------|--------|--------------------------|----------|
+| `malformed` (stage 1, sanity)            | 54  |  571 /  852 / 1137 | 1.55 us |
+| `bad-checksum` (stage 1, MAC report)     | 12  | 1166 / 1177 / 1233 | 2.14 us |
+| `spoofed` (stage 2, anti-spoofing)       | 24  | 1225 / 1260 / 1360 | 2.29 us |
+| `tcp-scan` (stage 3, scan detection)     | 30  | 1357 / 1388 / 1437 | 2.52 us |
+| rule `ping` (#2) pass                    | 76  | 1471 / 1527 / 1569 | 2.78 us |
+| rule `ping` (#2) rate-limit drop         | 164 | 1491 / 1519 / 1560 | 2.76 us |
+| rule `udp-test` (#5) pass                | 27  | 1832 / 1859 / 1899 | 3.38 us |
+| `default` drop (no rule matched)         | 36  | 1785 / 1860 / 2373 | 3.38 us |
+| rule `tcp` (#4) pass                     | 6   | 1922 / 1942 / 2003 | 3.53 us |
+| rule `tcp-new` (#3) rate-limit drop      | 42  | 1915 / 1946 / 1996 | 3.54 us |
+| rule `tcp-new` (#3) pass                 | 58  | 1924 / 1958 / 2064 | 3.56 us |
+
+Every counter moved by exactly what the scenario promises (e.g. `malformed
+--count 2`: malformed +18, bad-checksum +4, passed +2; `spoof --count 2`:
+spoofed +12, default +2). `default` also holds the BBB's own background
+frames (DHCP), hence its wider max.
+
+**Logic analyzer cross-check, per scenario** (pulse-width histogram, which
+splits the paths from outside the chip):
+
+| Scenario | Frames | Pulses | Groups seen by the analyzer | Analyzer avg vs. DWT avg |
+|----------|--------|--------|-----------------------------|--------------------------|
+| `normal --count 11`      | 11  | 11  | one group, 1788-1879 cycles | 1808 vs 1849 |
+| `spoof --count 2`        | 14  | 14  | 12 spoofed at 1192-1329 + 2 default at 1742 | 1238 vs ~1270 (spoofed) |
+| `scan --count 3`         | 18  | 18  | 15 scans at 1329-1421 + 3 tcp pass at 1879 | 1360 vs ~1390 (scans) |
+| `malformed --count 2`    | 24  | 23  | 8 at 550-642 + 10 at 917-1100 (malformed), 4 at 1146 (bad-checksum), 1 pass | 838 vs ~854 (malformed) |
+| `syn-flood --count 100`  | 100 | 100 | one group, 1879-2017 | 1914 vs ~1953 |
+| `ping-flood --count 120` | 120 | 120 | one group, 1375-1558 (6 MHz, +/- 92 cycles) | 1493 vs 1523 |
+
+The analyzer saw every frame except one control frame at the end of the
+`malformed` run (the last frames sent; the capture window most likely
+closed first). The same ~20-40 cycle offset as above appears in every run.
+
+**What the numbers say**
+- **The earlier a frame is decided, the cheaper it is.** The cost grows with
+  the pipeline order: sanity (malformed, ~850) < MAC checksum report (~1180)
+  < anti-spoofing (~1260) < scan detection (~1390) < rule table (1520-1960).
+  Bad traffic that is caught early is cheap: a malformed frame costs less
+  than half of a frame that passes.
+- **The analyzer even sees the order inside one stage.** The malformed run
+  splits into two groups: 8 frames at ~600 cycles (4 broken IPv4 header kinds
+  x 2: version, IHL, total length) and 10 at ~1000 (5 broken TCP/UDP header
+  or fragment kinds x 2), which are only checked after the IPv4 header has
+  been parsed.
+- **First match: rule position matters.** Among non-TCP frames, `ping`
+  (matched by rule #2) costs ~1520 cycles and `udp-test` (rule #5) ~1860:
+  about 110 cycles for every rule checked before the match (Debug build). A
+  frame that matches nothing walks all 5 rules (`default`, ~1860). The most
+  common traffic should sit at the top of the table.
+- **TCP costs more than its rule position.** TCP frames (rules #3 and #4)
+  cost ~1950, more than `udp-test` at #5: the TCP header is parsed further
+  and goes through scan detection.
+- **A rate-limited drop costs the same as a pass** (ping 1519 vs 1527,
+  tcp-new 1946 vs 1958): the token bucket is checked only after the frame has
+  walked the whole pipeline and matched its rule. During a flood the filter
+  pays full price for every frame. Rate limiting protects what is behind the
+  board, not the board's own CPU; an early per-source block (before the
+  rules) would make flood frames cheap.
+- **Token buckets behave as configured.** `ping-flood --count 120` gave
+  38 passed / 82 rate-limited twice in a row (burst 5 + 10/s for ~3.3 s, the
+  BBB sends ~36 frames/s); `syn-flood --count 100` gave 58 / 42 (burst 5 +
+  20/s for ~2.6 s).
+
+**How the data was collected** (and what went wrong)
+- The board was flashed once and not reset, so the per-path numbers add up
+  over all runs. Every run used its own `--count`, and the counters' change
+  proved which run each stats line belongs to. The PuTTY session was logged
+  to a file and the numbers were read from it.
+- The analyzer script starts on the first rising edge. Three times it
+  started on a background frame from the BBB (its DHCP client) and its window
+  ended before the scenario was sent (1 pulse instead of 11, 24, 120). Those
+  captures were thrown away and repeated with a longer window (`--seconds 10`
+  or `--seconds 20 --rate 6m`).
+
+### Stress test setup (in progress)
+
+- Scapy sends only ~40 frames/s from the BBB, far below what the filter can
+  take. `tools/bbb/stress.sh` uses Linux **pktgen** (a packet generator in the
+  kernel) to send the same 60-byte UDP frame to port 5000 (rule `udp-test`)
+  at rising rates: 1k, 2k, 5k, 10k, 20k, 50k frames/s, then as fast as
+  possible.
+- To see where frames are lost, the board now prints a hardware line every
+  5 s: `--- hw: mac rx unicast N | filter saw M | fifo-overflow X dma-missed
+  Y | rbu Z | free bufs F/16 ---`. `mac rx unicast` is the MAC's own counter
+  (MMC `RX unicast good`), `fifo-overflow` / `dma-missed` are the MTL RX queue
+  drop counters (clear-on-read, summed every main-loop pass), `rbu` counts
+  DMA "receive buffer unavailable" interrupts (`HAL_ETH_ErrorCallback`), and
+  `free bufs` is the pool's free ring. Frames sent by pktgen vs. `mac rx` vs.
+  `passed` shows whether a frame was lost on the wire, in the MAC / DMA, or
+  in software.
+- `free bufs` alone is a snapshot taken once per 5 s. The line also shows
+  **low-water marks**: `low: period P, ever E, empty Z`, the fewest free
+  buffers seen in this 5 s period and since boot, and how often the DMA asked
+  for a buffer when none was left. They are updated in
+  `HAL_ETH_RxAllocateCallback()`, the only place a buffer is taken. Note that
+  an idle board shows `12/16`, not `16/16`: 4 buffers are always parked in
+  the 4 RX DMA descriptors, waiting for the next frames. 12 is the real
+  headroom for frames waiting on the main loop.
+
+### Stress run 1: reception died for good at 1000 frames/s
+
+Full bug write-up (symptom, root cause, fix, lessons):
+[docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md).
+
+| | Frames |
+|---|---|
+| Sent by pktgen (all 7 steps)       | 564 000 (max step: 300 000 in 2.02 s = 148 840 frames/s, the 100 Mbit/s line rate for 64-byte frames) |
+| Received by the MAC (`mac rx unicast`) | 564 000: nothing lost on the wire |
+| Seen by the filter                 | 892, then nothing until reset |
+| Dropped in the MAC RX FIFO         | 554 949 |
+
+The board died in the **first** step, 1000 frames/s, although the filter
+alone could take ~290 000/s. The log shows the moment:
+`mac rx unicast 892 | filter saw 884 | rbu 1 | free bufs 0/16`, and from then
+on `free bufs 15/16` with nothing received. Two bugs together:
+
+1. **The stats print blocks the main loop.** Every 5 s it prints ~600
+   characters; at 115 200 baud that is ~50 ms in which no frame is processed.
+   At 1000 frames/s ~50 frames arrive in that time, but there are only 16
+   buffers: the pool runs empty and the DMA raises "receive buffer
+   unavailable" (RBU) and suspends.
+2. **Nothing ever woke the DMA up again (the serious one).** The main loop
+   freed the buffers, but descriptors are only refilled inside
+   `HAL_ETH_ReadData()`, which only the RX interrupt called, and a suspended
+   DMA receives nothing, so there is no RX interrupt: a deadlock. One short
+   overload killed reception until reset.
+
+**Fix for bug 2:** `eth_rx_refill()`, called every main-loop pass. If the HAL
+still has descriptors without a buffer (`RxDescList.RxBuildDescCnt != 0`),
+it calls `HAL_ETH_ReadData()` with the ETH interrupt masked (the HAL's
+descriptor bookkeeping is not reentrant). That gives the freed buffers to
+the descriptors and writes the DMA tail pointer, which resumes a suspended
+DMA. The hw line counts these as `refills`. Bug 1 (blocking UART output) is
+next.
+
+### Stress run 2: with the DMA recovery fix
+
+Same ramp, same frames. Totals after each step (read from the stats lines):
+
+| After step | Rate | Sent (total) | MAC got | Passed | Lost (total) | rbu / refills |
+|---|---|---|---|---|---|---|
+| 1 | 1 000/s | 3 000 | 3 000 | 2 993 | 7 | 3 / 3 |
+| 2 | 2 000/s | 9 000 | 9 000 | 8 934 | 66 | 6 / 6 |
+| 3 | 5 000/s | 24 000 | 24 000 | 23 720 | 280 | 9 / 9 |
+| 6 | 50 000/s | 264 000 | 264 000 | 263 720 | 280 (+0 in steps 4-6) | 9 / 9 |
+| 7 | max, 148 840/s | 564 000 | 564 000 | 563 720 | 280 (+0) | 9 / 9 |
+
+- **The board survives overload.** The DMA ran out of buffers 9 times and
+  was woken up 9 times (`rbu` = `refills`). Before the fix the first time
+  was fatal.
+- **The filter keeps up with the 100 Mbit/s line rate.** Step 7 delivered
+  300 000 minimum-size frames at 148 840 frames/s, the most a 100 Mbit/s
+  link can carry, and all 300 000 passed (one 5 s window: `300000 frames`,
+  min 1821 / avg 1851 / max 1961 cycles, the same 3.37 us per frame as at
+  low rate). At line rate the filter uses about half of the CPU
+  (148 840 x 3.37 us = 0.50 s per second). On this link the bottleneck is
+  the cable, not the filter.
+- **Every lost frame was lost while the stats were printing.** The 280
+  losses all happened in steps 1-3, where a stats print fell inside a step
+  (snapshots during those steps show `free bufs 0/16`). In steps 4-7 the
+  prints happened to fall in the 12 s pauses: luck, not a fix. Under
+  constant traffic every print would lose frames (~50 ms x 148 840/s ≈ 7 400
+  frames at line rate). That is bug 1.
+
+**Fix for bug 1: non-blocking log output (`uart_log.[ch]`).** `printf` used
+to end in `HAL_UART_Transmit()`, which waits ~87 us for every character. Now
+`_write` (overriding the weak one in `syscalls.c`) only copies the text into
+a 4 KB RAM ring and returns; the USART3 "transmit register empty" interrupt
+sends one byte per interrupt in the background and switches itself off when
+the ring is empty. Single producer (main loop) / single consumer (ISR), like
+the frame rings. USART3 has priority 5, below ETH (0), so frames always come
+first; enabling the TX interrupt masks only USART3, never ETH. If a write
+does not fit, the whole write is dropped and counted (`log-drop` in the hw
+line): losing log text is better than losing frames. USART3 belongs to the
+Nucleo BSP (COM1), not to a CubeMX peripheral, so its NVIC setup is in
+`uart_log_init()`.
+- The run was not captured in the PuTTY log file (logging was off after
+  the reflash); the numbers above are from the stats lines on screen.
+
+### Stress run 3: both fixes, zero loss at line rate
+
+Same frames, logged to a file (`putty_stress3.log`). Test A is the same
+ramp; test B is sustained line rate (`sudo MAX_COUNT=4500000 sh stress.sh 0`,
+4.5 million frames, ~31 s), so it must overlap ~6 stats prints.
+
+| Test | Sent | MAC got | Passed | `fifo-overflow` | `dma-missed` | `rbu` / `refills` | `log-drop` |
+|---|---|---|---|---|---|---|---|
+| A: ramp 1k ... max | 564 000 | 564 000 | 564 000 | 0 | 0 | 19 / 4 | 0 |
+| B: 31 s at max (totals A+B) | 5 064 000 | 5 064 000 | 5 064 000 | 0 | 0 | 66 / 28 | 0 |
+
+- **No frame lost.** During test B every 5 s window held ~730 500 frames
+  (~146 000 frames/s, the line rate) and every one passed, while the stats
+  were printed every 5 s.
+- **RBU is harmless now.** At line rate the DMA still runs out of
+  descriptors for a moment (`rbu` 66), but the MAC's RX FIFO holds the next
+  frames for those few microseconds and the main loop re-arms the DMA
+  (`refills`), so nothing overflows. Before fix 1 the first RBU was fatal.
+- **The filter's cost does not change under load:** min / avg 1819 / 1847
+  cycles in every window, as at 10 frames/s. Only `max` grows, to
+  3000-3600 cycles at line rate: frames whose measurement was interrupted by
+  the next frame's ETH interrupt. That puts the RX interrupt itself at about
+  1 500 cycles (~2.7 us, Debug build). Filter + interrupt ≈ 6 us per frame
+  against 6.7 us between frames at line rate: the CPU is close to fully
+  busy.
+- **Margin:** at the moments the stats are printed during line-rate traffic
+  only `free bufs 3/16` remain. Formatting the text (printf turning numbers
+  into characters) still holds the main loop for roughly 60-90 us, and ~10
+  frames queue up meanwhile. This snapshot looked like a margin of 3
+  buffers; edge test 1 below shows the real low point is 0.
+
+### Edge test 1: how close does the pool get to empty?
+
+`free bufs 3/16` above is a snapshot taken at print time. With the
+low-water marks (`putty_edge.log`, `sudo MAX_COUNT=1500000 sh stress.sh 0`,
+~10 s at line rate):
+
+| 5 s window | Frames | Lost | Fewest free buffers in the window | Pool found empty (total) | `rbu` (total) |
+|---|---|---|---|---|---|
+| 1 | 639 581 | 0 | 3 | 0  | 0  |
+| 2 | 730 368 | 0 | **0** | 32 | 9  |
+| 3 (end) | 130 051 | 0 | **0** | 60 | 16 |
+
+Total: 1 500 000 sent, 1 500 000 passed.
+
+- **The pool does run empty at line rate:** 60 times in ~10 s the DMA asked
+  for a buffer and none was left. The snapshot (`3/16`) hid this. The real
+  margin of the 16-buffer pool at line rate is **zero**, not 3.
+- **Still no frame was lost** because of a second, hardware buffer: the
+  MAC's own RX FIFO (MTL queue) keeps receiving while the DMA waits, and
+  `eth_rx_refill()` re-arms the DMA before that FIFO overflows
+  (`fifo-overflow` stayed 0). So line rate works today on pool + FIFO
+  together, with little to spare.
+- **Growing the pool is limited by memory:** the pool must sit in D2 SRAM
+  (the non-cacheable MPU region the ETH DMA uses), which is 32 KB; 16 x
+  1536 B = 24.5 KB already, so ~20 buffers is the most that fits. More would
+  need the pool in AXI SRAM (D1, 320 KB) with its own non-cacheable MPU
+  region. The cheaper levers are shorter main-loop stalls (print the stats
+  in pieces) and more RX descriptors.
+
+**Summary of the stress tests**
+
+| Run | Firmware | Result |
+|---|---|---|
+| 1 | before fixes | reception died for good after 892 frames at 1 000 frames/s |
+| 2 | + DMA recovery (`eth_rx_refill`) | survives; 280 frames lost, all during blocking stats prints |
+| 3 | + non-blocking log (`uart_log`) | 5 064 000 of 5 064 000 frames, 31 s at line rate, 0 lost |
+
+### Edge test 2: CPU headroom, and the whole cost of one frame
+
+At line rate (64 B frames, ~148 800 frames/s) a new frame arrives every
+**~3 700 CPU cycles** (550 MHz / 148 800). The filter alone takes ~1 850, so
+on paper half the CPU looks free. Two experiments check that
+(`putty_headroom.log`, `sudo MAX_COUNT=1500000 sh stress.sh 0`, log OFF).
+
+**1. Headroom: add fake work until frames are lost.** `EXTRA_CYCLES` in
+`main.c` makes the main loop spin that many extra cycles per frame (on the
+DWT counter, after the filter is measured, before the buffer is freed):
+
+| `EXTRA_CYCLES` | Sent | Lost | Pool found empty |
+|---|---|---|---|
+| 0    | 1 500 000 | **0** | 60 |
+| 250  | 1 500 000 | **0** | 152 909 |
+| 500  | 1 500 000 | 7 873 (0.5 %) | 172 746 |
+| 1000 | 1 500 000 | 31 949 (2.1 %) | 71 391 |
+
+Only **~250-500 cycles per frame are free**, not ~1 850. With extra work the
+first seconds are clean; the loss starts after a stats print stalls the main
+loop: with no spare cycles the backlog from that pause is never cleared.
+
+**2. Whole cost per frame.** Why so little room? The filter is only part of
+the work for one frame. The firmware now also times the ETH interrupt
+(`ETH_IRQHandler`, HAL driver + our callbacks) and the whole main-loop RX
+work (pop, filter, free, refill), with the interrupt time that cut into the
+main loop taken out, and prints every 5 s:
+
+```
+--- whole cost/frame (470548 frames): isr 1222 + main 2434 = 3656 cycles | cpu busy on rx 62% ---
+```
+
+| Part | Cycles per frame |
+|---|---|
+| ETH interrupt (HAL RX path, descriptor + checksum flags, ring push) | 1 222 |
+| Filter (`pkt_filter_process`) | 1 858 |
+| Rest of the main loop (pop, free, refill, measurement) | ~576 |
+| **Total** | **3 656** of a ~3 700 budget |
+
+- The cost per frame is the same at every rate; only the busy share changes:
+  3 656 x 93 000 frames/s = 62 % (this run), 3 656 x 146 000 = ~97 % (an
+  earlier run at full line rate printed 96 %).
+- So at 100 Mbit/s line rate the CPU is **~96 % busy** at `-O0`: the driver
+  around the filter costs about as much as the filter itself. That matches
+  the headroom test.
+- A lone frame after a quiet period costs much more (~14 000 cycles in the
+  main loop): caches and branch predictors are cold.
+- Two measurement pitfalls fixed on the way: the cycle counter and the ISR
+  total are read as one consistent pair (`time_snapshot()` re-reads if the
+  ISR fired in between; otherwise the difference could go negative and wrap
+  to ~4 billion), and only loop passes that handled frames are counted (an
+  empty pass is the CPU waiting, not frame work).
+
+**What it means for a faster link:** 1 Gbit/s line rate is 1 488 000 frames/s
+= **~370 cycles per frame** at 550 MHz, ten times less than this board needs
+today. That is why real NICs do this work in hardware (or many cores) and
+keep the per-packet software path to a few hundred cycles.
+
+**Still to measure:** an optimised (`-O2`) build, which should shrink both
+the HAL driver part and the filter part.
 
 ## BBB test link
 
@@ -341,6 +760,7 @@ hand-written code stays inside `USER CODE` blocks or in separate files.
    STM32_Programmer_CLI -c port=SWD mode=UR -w Debug/STM32-SmartNIC.elf -v -hardRst
    ```
 3. Open the ST-LINK virtual COM port at 115200 baud to see the log.
+   Press the blue USER button to turn the per-frame log off / on (yellow LED).
 
 ### Command-line build (used by CI)
 
@@ -375,12 +795,17 @@ Core/Inc, Core/Src
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
+  perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max, ETH ISR total
+  uart_log.[ch]          non-blocking printf: RAM ring + USART3 TX interrupt
   pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
   filter_policy.[ch]     the rule table the board runs (BBB link)
   main.c                 init sequence, main loop, rule table and counters
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
+tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
+tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
 tests/                   host unit tests (parser, filter) + Makefile
+docs/bug-rx-deadlock.md  bug write-up: RX deadlock after buffer exhaustion
 .github/workflows/ci.yml CI: host tests + firmware build on every push
 firmware.mk              command-line firmware build (same flags as CubeIDE)
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
@@ -389,13 +814,17 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 
 ## Known limitations
 
-- If all 16 buffers are in use, the DMA stops with "RX buffer unavailable" and is
-  not yet restarted automatically when buffers are freed.
-- The core runs directly from the 8 MHz HSE clock; PLL configuration to full
-  speed is planned for the profiling phase.
+- Log output is limited to 115 200 baud (~11 500 characters/s). With the
+  per-frame log ON at high rates the 4 KB log ring fills and whole log lines
+  are dropped (counted as `log-drop`); frames are not affected.
+- At line rate the 16-buffer pool runs empty for moments (low-water mark 0,
+  edge test 1); no frame is lost only because the MAC's RX FIFO covers the
+  gap. More stats text, or more work per frame, would need a bigger pool
+  (limited by the 32 KB D2 SRAM) or printing the stats in smaller pieces.
+- At line rate the CPU is ~96 % busy (`-O0` build): only ~250-500 spare
+  cycles per frame (edge test 2), so heavier rules would lose frames at
+  line rate until the RX path is optimised (`-O2`, lighter driver path).
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
-- The `flags` field of the packet descriptor is not filled yet (no per-frame
-  error reporting).
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.
 - The filter is stateless (no connection tracking): ACK / FIN+ACK scans look
@@ -405,9 +834,18 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Rate limits are per rule, shared by all senders: a flood is capped, but it
   also takes the share of honest senders. Per-source buckets (a hash table
   keyed by source IP, plus the total cap) would make it fair.
+- A rate-limited frame costs as much CPU as a passed one (measured, see
+  Performance): the bucket is checked after the full pipeline, so a flood is
+  capped but not cheap to filter.
+- The BBB's `eth0` still runs a DHCP client (left from the Scapy install), so
+  it sends a background frame now and then; it lands in `default` and can
+  start an analyzer capture early.
 - No device can stop a flood larger than its link: that has to be filtered
   upstream.
 - Rules cannot say "not" (e.g. "source not in subnet"); ingress filtering is
   done by requiring the subnet in every allow rule.
-- The COM log loses characters (e.g. `passd`, `drppe`) under steady
-  traffic. Under investigation (per-frame printf load, 8 MHz clock).
+- With the per-frame log on, `printf` at 115200 baud (~140 lines/s) limits how
+  fast frames can be processed; turn it off with the USER button for
+  throughput tests.
+- Cycle numbers come from the Debug build (`-O0`, no optimisation); an
+  optimised build will be faster.

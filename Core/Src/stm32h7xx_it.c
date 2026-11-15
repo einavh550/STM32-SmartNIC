@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "perf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -218,11 +219,13 @@ void EXTI15_10_IRQHandler(void)
 void ETH_IRQHandler(void)
 {
   /* USER CODE BEGIN ETH_IRQn 0 */
-
+  /* Time the whole RX interrupt (HAL + our callbacks) so the main loop can
+   * add it to its own work and get the full CPU cost per frame. */
+  uint32_t isr_t0 = perf_now();
   /* USER CODE END ETH_IRQn 0 */
   HAL_ETH_IRQHandler(&heth);
   /* USER CODE BEGIN ETH_IRQn 1 */
-
+  perf_eth_isr_cycles += perf_now() - isr_t0;
   /* USER CODE END ETH_IRQn 1 */
 }
 
