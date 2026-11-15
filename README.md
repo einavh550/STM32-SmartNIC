@@ -1,6 +1,6 @@
 # STM32-SmartNIC
 
-[![host-tests](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/host-tests.yml)
+[![ci](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/ci.yml/badge.svg)](https://github.com/einavh550/STM32-SmartNIC/actions/workflows/ci.yml)
 
 Bare-metal firmware that turns an STM32H723 into a simple SmartNIC: it receives
 Ethernet frames through the MAC's DMA, hands them from the interrupt to the main
@@ -744,9 +744,22 @@ where make is called `mingw32-make`).
 cd tests
 make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
+make tsan       # ring buffer, 2 threads, ThreadSanitizer (Linux/macOS)
 ```
 
 Expected last line: `401 checks, 0 failed: PASS`.
+
+`make tsan` runs the SPSC ring buffer with a real producer thread and a real
+consumer thread (on the board: ETH ISR and main loop) for 2 000 000
+descriptors and checks each one arrives once, in order, intact:
+`ring buffer 2-thread test: 2000000 frames, ... 0 errors -> PASS`.
+ThreadSanitizer also checks that every shared access is synchronised. To
+show it is not a toothless test: with the `release`/`acquire` on `head`
+changed to `relaxed`, it fails with `data race ... rb_push (ring_buffer.c:43)`
+vs `rb_pop (ring_buffer.c:66)`, the slot write and the slot read that the
+ordering protects. On a kernel with high address randomisation TSan stops
+with `unexpected memory mapping`; run it as
+`setarch $(uname -m) -R make tsan` (CI lowers `vm.mmap_rnd_bits` instead).
 
 ## Build and flash
 
@@ -761,6 +774,33 @@ hand-written code stays inside `USER CODE` blocks or in separate files.
    ```
 3. Open the ST-LINK virtual COM port at 115200 baud to see the log.
    Press the blue USER button to turn the per-frame log off / on (yellow LED).
+
+### Command-line build (used by CI)
+
+`firmware.mk` builds the same `.elf` without the IDE, with the CubeIDE
+`Debug` compiler flags plus `-Werror`. CubeIDE's own generated makefile lives
+in `Debug/`, which is not in git, so CI uses this one. Both builds give
+identical section sizes.
+
+```
+make -f firmware.mk        # -> build/fw/STM32-SmartNIC.elf (Windows: mingw32-make)
+```
+
+Needs `arm-none-eabi-gcc` in `PATH` (Ubuntu: `apt install gcc-arm-none-eabi
+libnewlib-arm-none-eabi`; or the one inside STM32CubeIDE's
+`plugins/*gnu-tools-for-stm32*/tools/bin`).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, one job per
+check:
+
+| Job | What it checks |
+|---|---|
+| Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
+| Ring buffer, 2 threads | producer and consumer threads push/pop 2 000 000 descriptors under ThreadSanitizer: no lost, duplicated or torn descriptor, no data race |
+| Tools syntax | every Python script under `tools/` compiles (`py_compile`) and every shell script parses (`sh -n`), so a typo is caught before it reaches the BBB |
+| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
 
 ## Project layout
 
@@ -779,9 +819,10 @@ Core/Inc, Core/Src
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
 tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
 tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
-tests/                   host unit tests (parser, filter) + Makefile
+tests/                   host unit tests (parser, filter), 2-thread ring buffer test (TSan) + Makefile
 docs/bug-rx-deadlock.md  bug write-up: RX deadlock after buffer exhaustion
-.github/workflows/       CI: runs the host tests on every push
+.github/workflows/ci.yml CI: host tests + firmware build on every push
+firmware.mk              command-line firmware build (same flags as CubeIDE)
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
 STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 ```
