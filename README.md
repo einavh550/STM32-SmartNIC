@@ -24,7 +24,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | Planned: `-O2` build, polling RX (fewer interrupts), measured with the whole-cost line |
+| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); next: polling RX (fewer interrupts), measured with the whole-cost line |
 
 ## RX data path
 
@@ -696,8 +696,39 @@ main loop taken out, and prints every 5 s:
 today. That is why real NICs do this work in hardware (or many cores) and
 keep the per-packet software path to a few hundred cycles.
 
-**Still to measure:** an optimised (`-O2`) build, which should shrink both
-the HAL driver part and the filter part.
+### Phase 5, step 1: optimised build (`-O2`)
+
+Same firmware and same stress test (`sudo MAX_COUNT=1500000 sh stress.sh 0`,
+60-byte UDP frames at ~145 000 frames/s), built with `-O2` instead of `-O0`
+(`make -f firmware.mk OPT=-O2`). Log: `putty_o2.log`.
+
+| | `-O0` (Debug) | `-O2` | Speed-up |
+|---|---|---|---|
+| Frames sent / seen by the MAC / seen by the filter | 1.5 M / 1.5 M / 1.5 M | 1.5 M / 1.5 M / 1.5 M | 0 lost in both |
+| Filter, cycles per frame (avg) | 1 858 (3.37 µs) | **630 (1.15 µs)** | 2.9x |
+| ETH ISR, cycles per frame | 1 222 | **769** | 1.6x |
+| Main loop RX work, cycles per frame | 2 434 | **891** | 2.7x |
+| **Whole cost per frame** | 3 656 | **1 660** | **2.2x** |
+| CPU busy on RX at line rate | ~96 % | **~43 %** | more than half the CPU now free |
+
+- The filter (our own code) gains the most: at `-O0` every variable lives
+  in memory; at `-O2` it stays in registers and small functions are inlined.
+- The ISR gains the least, so it is now the **largest single part** of the
+  cost (769 of 1 660 cycles). Most of it is the ST HAL driver (descriptor
+  walk, callbacks), so the next step is fewer interrupts per frame
+  (NAPI-style polling: mask the RX interrupt while the main loop drains).
+- The buffer pool still runs empty for moments (`rbu` +4, failed
+  allocations +12 in 1.5 M frames) and no frame is lost. Even with half the
+  CPU free the pool empties, so the stats print stall (not the per-frame
+  cost) is what drains it.
+- The first try of this run was invalid: the per-frame log was still on
+  after flashing (it starts on). Every frame then tried to `printf`
+  (41 M log writes dropped, ~10 000 cycles per frame in the main loop) and
+  ~65 % of frames were lost in the MAC FIFO. Turn the log off with the USER
+  button before any throughput test.
+
+**Still to measure:** the CPU headroom at `-O2` (edge test 2 again), and
+polling RX.
 
 ## BBB test link
 
@@ -783,8 +814,12 @@ in `Debug/`, which is not in git, so CI uses this one. Both builds give
 identical section sizes.
 
 ```
-make -f firmware.mk        # -> build/fw/STM32-SmartNIC.elf (Windows: mingw32-make)
+make -f firmware.mk            # -> build/fw/STM32-SmartNIC.elf (-O0; Windows: mingw32-make)
+make -f firmware.mk OPT=-O2    # -> build/fw-O2/STM32-SmartNIC.elf (optimised)
 ```
+
+Each optimisation level gets its own build folder, so object files from the
+two builds never mix.
 
 Needs `arm-none-eabi-gcc` in `PATH` (Ubuntu: `apt install gcc-arm-none-eabi
 libnewlib-arm-none-eabi`; or the one inside STM32CubeIDE's
@@ -800,7 +835,7 @@ check:
 | Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
 | Ring buffer, 2 threads | producer and consumer threads push/pop 2 000 000 descriptors under ThreadSanitizer: no lost, duplicated or torn descriptor, no data race |
 | Tools syntax | every Python script under `tools/` compiles (`py_compile`) and every shell script parses (`sh -n`), so a typo is caught before it reaches the BBB |
-| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
+| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`), both at `-O0` and at `-O2` (`-O2` analyses more and can warn where `-O0` is silent); both `.elf` and `.map` files are kept as a download |
 
 ## Project layout
 
@@ -836,9 +871,9 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   edge test 1); no frame is lost only because the MAC's RX FIFO covers the
   gap. More stats text, or more work per frame, would need a bigger pool
   (limited by the 32 KB D2 SRAM) or printing the stats in smaller pieces.
-- At line rate the CPU is ~96 % busy (`-O0` build): only ~250-500 spare
-  cycles per frame (edge test 2), so heavier rules would lose frames at
-  line rate until the RX path is optimised (`-O2`, lighter driver path).
+- At line rate the CPU is ~96 % busy in the `-O0` build (only ~250-500
+  spare cycles per frame, edge test 2) and ~43 % busy in the `-O2` build.
+  The ETH ISR (mostly HAL driver code) is now the largest part of the cost.
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.
@@ -862,5 +897,6 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - With the per-frame log on, `printf` at 115200 baud (~140 lines/s) limits how
   fast frames can be processed; turn it off with the USER button for
   throughput tests.
-- Cycle numbers come from the Debug build (`-O0`, no optimisation); an
-  optimised build will be faster.
+- Most cycle numbers in Performance come from the Debug build (`-O0`, no
+  optimisation); the `-O2` section shows the optimised numbers
+  (about 2-3x faster).
