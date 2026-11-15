@@ -23,8 +23,8 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom) |
-| 5     | Profiling, throughput limits, hardening       | Planned     |
+| 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
+| 5     | Profiling, throughput limits, hardening       | Planned: `-O2` build, polling RX (fewer interrupts), measured with the whole-cost line |
 
 ## RX data path
 
@@ -465,7 +465,7 @@ closed first). The same ~20-40 cycle offset as above appears in every run.
   captures were thrown away and repeated with a longer window (`--seconds 10`
   or `--seconds 20 --rate 6m`).
 
-### Stress test setup (in progress)
+### Stress test setup
 
 - Scapy sends only ~40 frames/s from the BBB, far below what the filter can
   take. `tools/bbb/stress.sh` uses Linux **pktgen** (a packet generator in the
