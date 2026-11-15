@@ -4,13 +4,21 @@
 # of Windows paths), so CI cannot use it. This file builds the same .elf with
 # the same compiler flags as the CubeIDE Debug configuration.
 #
-#   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf
+#   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf (-O0, like CubeIDE Debug)
+#   make -f firmware.mk OPT=-O2  # optimised build in build/fw-O2/ (Phase 5 measurements)
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
 
 TARGET   := STM32-SmartNIC
+# Optimisation level. -O0 matches CubeIDE Debug; any other level gets its
+# own build folder so the two builds never mix object files.
+OPT      ?= -O0
+ifeq ($(OPT),-O0)
 BUILD    := build/fw
+else
+BUILD    := build/fw$(OPT)
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -34,7 +42,7 @@ INCS := -ICore/Inc \
         -IDrivers/CMSIS/Include
 
 # Same as CubeIDE Debug, plus -Werror: in CI any warning fails the build.
-CFLAGS := $(CPU) -std=gnu11 -g3 -O0 $(DEFS) $(INCS) \
+CFLAGS := $(CPU) -std=gnu11 -g3 $(OPT) $(DEFS) $(INCS) \
           -ffunction-sections -fdata-sections -Wall -Werror \
           --specs=nano.specs -MMD -MP
 
