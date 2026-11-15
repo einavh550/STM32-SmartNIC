@@ -15,6 +15,20 @@ jobs:
       - name: Build and run tests (with AddressSanitizer + UBSan)
         run: make -C tests SAN=1
 
+  ring-buffer-threads:
+    name: Ring buffer, 2 threads (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # TSan needs a fixed memory layout; recent kernels randomise addresses
+      # with more bits than it supports ("unexpected memory mapping").
+      - name: Reduce address randomisation for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Producer + consumer threads, 2 million frames
+        run: make -C tests tsan
+
   firmware-build:
     name: Firmware build (arm-none-eabi, -Werror)
     runs-on: ubuntu-latest

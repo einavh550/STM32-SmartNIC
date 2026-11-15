@@ -744,9 +744,22 @@ where make is called `mingw32-make`).
 cd tests
 make            # Windows: mingw32-make
 make SAN=1      # with AddressSanitizer + UBSan (Linux/macOS)
+make tsan       # ring buffer, 2 threads, ThreadSanitizer (Linux/macOS)
 ```
 
 Expected last line: `401 checks, 0 failed: PASS`.
+
+`make tsan` runs the SPSC ring buffer with a real producer thread and a real
+consumer thread (on the board: ETH ISR and main loop) for 2 000 000
+descriptors and checks each one arrives once, in order, intact:
+`ring buffer 2-thread test: 2000000 frames, ... 0 errors -> PASS`.
+ThreadSanitizer also checks that every shared access is synchronised. To
+show it is not a toothless test: with the `release`/`acquire` on `head`
+changed to `relaxed`, it fails with `data race ... rb_push (ring_buffer.c:43)`
+vs `rb_pop (ring_buffer.c:66)`, the slot write and the slot read that the
+ordering protects. On a kernel with high address randomisation TSan stops
+with `unexpected memory mapping`; run it as
+`setarch $(uname -m) -R make tsan` (CI lowers `vm.mmap_rnd_bits` instead).
 
 ## Build and flash
 
@@ -785,6 +798,7 @@ check:
 | Job | What it checks |
 |---|---|
 | Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
+| Ring buffer, 2 threads | producer and consumer threads push/pop 2 000 000 descriptors under ThreadSanitizer: no lost, duplicated or torn descriptor, no data race |
 | Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
 
 ## Project layout
@@ -804,7 +818,7 @@ Core/Inc, Core/Src
 tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
 tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
 tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
-tests/                   host unit tests (parser, filter) + Makefile
+tests/                   host unit tests (parser, filter), 2-thread ring buffer test (TSan) + Makefile
 docs/bug-rx-deadlock.md  bug write-up: RX deadlock after buffer exhaustion
 .github/workflows/ci.yml CI: host tests + firmware build on every push
 firmware.mk              command-line firmware build (same flags as CubeIDE)
