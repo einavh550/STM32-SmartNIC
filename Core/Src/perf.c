@@ -6,6 +6,8 @@
 
 static uint32_t overhead_cycles;
 
+volatile uint32_t perf_eth_isr_cycles;
+
 void perf_init(void)
 {
   /* DWT belongs to the debug block: switch the trace/debug unit on first. */

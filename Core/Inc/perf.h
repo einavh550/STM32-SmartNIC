@@ -46,6 +46,10 @@ void perf_reset(perf_stats_t *s);
 /** Cycles of an empty measurement (two back-to-back perf_now() reads). */
 uint32_t perf_overhead(void);
 
+/** Total CPU cycles spent inside ETH_IRQHandler since boot (wraps at 2^32;
+ *  read it as a difference). Written only by the ETH ISR. */
+extern volatile uint32_t perf_eth_isr_cycles;
+
 /** Convert cycles to nanoseconds at the current CPU clock. */
 uint32_t perf_cycles_to_ns(uint32_t cycles);
 

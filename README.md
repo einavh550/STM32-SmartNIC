@@ -23,7 +23,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 1     | Lock-free SPSC ring buffer + on-target test   | Done        |
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
-| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes) |
+| 4     | Traffic generation and stress tests from the BBB | In progress: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom) |
 | 5     | Profiling, throughput limits, hardening       | Planned     |
 
 ## RX data path
@@ -635,8 +635,66 @@ Total: 1 500 000 sent, 1 500 000 passed.
 | 2 | + DMA recovery (`eth_rx_refill`) | survives; 280 frames lost, all during blocking stats prints |
 | 3 | + non-blocking log (`uart_log`) | 5 064 000 of 5 064 000 frames, 31 s at line rate, 0 lost |
 
-**Still to measure:** an optimised (`-O2`) build, and heavier work per frame
-(more rules) to find where the CPU, not the cable, becomes the limit.
+### Edge test 2: CPU headroom, and the whole cost of one frame
+
+At line rate (64 B frames, ~148 800 frames/s) a new frame arrives every
+**~3 700 CPU cycles** (550 MHz / 148 800). The filter alone takes ~1 850, so
+on paper half the CPU looks free. Two experiments check that
+(`putty_headroom.log`, `sudo MAX_COUNT=1500000 sh stress.sh 0`, log OFF).
+
+**1. Headroom: add fake work until frames are lost.** `EXTRA_CYCLES` in
+`main.c` makes the main loop spin that many extra cycles per frame (on the
+DWT counter, after the filter is measured, before the buffer is freed):
+
+| `EXTRA_CYCLES` | Sent | Lost | Pool found empty |
+|---|---|---|---|
+| 0    | 1 500 000 | **0** | 60 |
+| 250  | 1 500 000 | **0** | 152 909 |
+| 500  | 1 500 000 | 7 873 (0.5 %) | 172 746 |
+| 1000 | 1 500 000 | 31 949 (2.1 %) | 71 391 |
+
+Only **~250-500 cycles per frame are free**, not ~1 850. With extra work the
+first seconds are clean; the loss starts after a stats print stalls the main
+loop: with no spare cycles the backlog from that pause is never cleared.
+
+**2. Whole cost per frame.** Why so little room? The filter is only part of
+the work for one frame. The firmware now also times the ETH interrupt
+(`ETH_IRQHandler`, HAL driver + our callbacks) and the whole main-loop RX
+work (pop, filter, free, refill), with the interrupt time that cut into the
+main loop taken out, and prints every 5 s:
+
+```
+--- whole cost/frame (470548 frames): isr 1222 + main 2434 = 3656 cycles | cpu busy on rx 62% ---
+```
+
+| Part | Cycles per frame |
+|---|---|
+| ETH interrupt (HAL RX path, descriptor + checksum flags, ring push) | 1 222 |
+| Filter (`pkt_filter_process`) | 1 858 |
+| Rest of the main loop (pop, free, refill, measurement) | ~576 |
+| **Total** | **3 656** of a ~3 700 budget |
+
+- The cost per frame is the same at every rate; only the busy share changes:
+  3 656 x 93 000 frames/s = 62 % (this run), 3 656 x 146 000 = ~97 % (an
+  earlier run at full line rate printed 96 %).
+- So at 100 Mbit/s line rate the CPU is **~96 % busy** at `-O0`: the driver
+  around the filter costs about as much as the filter itself. That matches
+  the headroom test.
+- A lone frame after a quiet period costs much more (~14 000 cycles in the
+  main loop): caches and branch predictors are cold.
+- Two measurement pitfalls fixed on the way: the cycle counter and the ISR
+  total are read as one consistent pair (`time_snapshot()` re-reads if the
+  ISR fired in between; otherwise the difference could go negative and wrap
+  to ~4 billion), and only loop passes that handled frames are counted (an
+  empty pass is the CPU waiting, not frame work).
+
+**What it means for a faster link:** 1 Gbit/s line rate is 1 488 000 frames/s
+= **~370 cycles per frame** at 550 MHz, ten times less than this board needs
+today. That is why real NICs do this work in hardware (or many cores) and
+keep the per-packet software path to a few hundred cycles.
+
+**Still to measure:** an optimised (`-O2`) build, which should shrink both
+the HAL driver part and the filter part.
 
 ## BBB test link
 
@@ -709,7 +767,7 @@ Core/Inc, Core/Src
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
-  perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max
+  perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max, ETH ISR total
   uart_log.[ch]          non-blocking printf: RAM ring + USART3 TX interrupt
   pkt_parse.[ch]         Ethernet / IPv4 / TCP / UDP header parser
   pkt_filter.[ch]        filter pipeline, rules, token buckets, counters
@@ -733,6 +791,9 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   edge test 1); no frame is lost only because the MAC's RX FIFO covers the
   gap. More stats text, or more work per frame, would need a bigger pool
   (limited by the 32 KB D2 SRAM) or printing the stats in smaller pieces.
+- At line rate the CPU is ~96 % busy (`-O0` build): only ~250-500 spare
+  cycles per frame (edge test 2), so heavier rules would lose frames at
+  line rate until the RX path is optimised (`-O2`, lighter driver path).
 - Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.

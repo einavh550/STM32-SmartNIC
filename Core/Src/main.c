@@ -40,6 +40,10 @@
 /* USER CODE BEGIN PD */
 #define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
 #define BUTTON_DEBOUNCE_MS (200u)   /* ignore button bounces closer than this */
+/* CPU headroom test: fake work added to every frame, in CPU cycles.
+ * 0 = normal firmware. Raise it step by step at line rate until frames
+ * are lost: the last value with zero loss = cycles still free per frame. */
+#define EXTRA_CYCLES       (0u)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -95,6 +99,14 @@ static perf_stats_t filter_cycles;
 static perf_stats_t path_reason[DROP_REASON_COUNT];
 static perf_stats_t path_pass[POLICY_RULE_COUNT];
 static perf_stats_t path_limit[POLICY_RULE_COUNT];
+
+/* Whole cost per frame = ETH ISR time + main-loop RX work (pop, filter,
+ * free, refill), summed over one stats period. The main-loop part has the
+ * ISR time that interrupted it taken out, so nothing is counted twice. */
+static uint64_t main_rx_cycles;    /* main-loop RX work, ISR time removed */
+static uint32_t main_rx_frames;    /* frames handled in this period */
+static uint32_t isr_cycles_mark;   /* perf_eth_isr_cycles at period start */
+static uint32_t period_start_ms;   /* HAL_GetTick() at period start */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,7 +124,29 @@ static void print_paths(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Burn exactly 'cycles' CPU cycles (headroom test). Spins on the DWT counter
+ * instead of a for-loop count, so the delay stays the same at any -O level. */
+static void burn_cycles(uint32_t cycles)
+{
+  uint32_t start = perf_now();
+  while ((perf_now() - start) < cycles)
+  {
+  }
+}
 
+/* Read the cycle counter and the ETH ISR total as one consistent pair.
+ * If the ISR fires between the two reads, the pair would not match (ISR
+ * time counted on one side only), so read again until no ISR got in. */
+static void time_snapshot(uint32_t *now, uint32_t *isr)
+{
+  uint32_t before;
+  do
+  {
+    before = perf_eth_isr_cycles;
+    *now   = perf_now();
+    *isr   = perf_eth_isr_cycles;
+  } while (*isr != before);
+}
 /* USER CODE END 0 */
 
 /**
@@ -240,6 +274,7 @@ int main(void)
   }
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
+  printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 
@@ -253,9 +288,15 @@ int main(void)
     pkt_desc_t pkt;
     pkt_hdr_t  hdr;
 
+    /* Start of the main-loop RX work (whole-cost measurement). */
+    uint32_t work_t0, work_isr;
+    time_snapshot(&work_t0, &work_isr);
+    uint32_t frames_now = 0u;   /* frames handled in this loop pass */
+
     /* Consumer side: take every frame the ISR queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
+      frames_now++;
       /* Parse, drop if malformed or the MAC reported a checksum error, else
        * run the rules. Counters are updated inside. HAL_GetTick() is read
        * before the timer starts so only the filter itself is measured. */
@@ -273,6 +314,13 @@ int main(void)
       uint32_t cycles = perf_now() - t0;
       perf_record(&filter_cycles, cycles);
       record_path(v, cycles);
+      /* Headroom test: pretend the filter is heavier. Outside the DWT window
+       * so the filter numbers stay clean; before the buffer is freed, like
+       * real extra work would be. */
+      if (EXTRA_CYCLES != 0u)
+      {
+        burn_cycles(EXTRA_CYCLES);
+      }
 
       if (log_frames != 0u)
       {
@@ -286,6 +334,17 @@ int main(void)
     /* Buffers were just freed: hand them to any RX descriptor left without
      * one, and wake the DMA if it stopped (see eth_rx_refill()). */
     eth_rx_refill();
+
+    /* End of the RX work: elapsed time minus the ISR time that cut into it.
+     * Only passes that handled frames count: an empty pass is idle polling
+     * (the CPU waiting for work), not a cost of any frame. */
+    uint32_t work_t1, work_isr1;
+    time_snapshot(&work_t1, &work_isr1);
+    if (frames_now != 0u)
+    {
+      main_rx_cycles += (work_t1 - work_t0) - (work_isr1 - work_isr);
+      main_rx_frames += frames_now;
+    }
 
     handle_button();
     eth_rx_poll_hw();   /* collect the MAC's clear-on-read drop counters */
@@ -596,6 +655,27 @@ static void print_stats(void)
     print_paths();   /* only when something new arrived, to keep the log short */
   }
   perf_reset(&filter_cycles);
+
+  /* Whole cost per frame (ISR + main loop) and how busy the CPU was. */
+  uint32_t now_ms     = HAL_GetTick();
+  uint32_t isr_now    = perf_eth_isr_cycles;
+  uint64_t isr_cycles = (uint32_t)(isr_now - isr_cycles_mark);
+  uint64_t period_cycles = (uint64_t)(now_ms - period_start_ms) * (SystemCoreClock / 1000u);
+  if ((main_rx_frames != 0u) && (period_cycles != 0u))
+  {
+    uint32_t isr_pf  = (uint32_t)(isr_cycles / main_rx_frames);
+    uint32_t main_pf = (uint32_t)(main_rx_cycles / main_rx_frames);
+    uint32_t busy_pct = (uint32_t)(((isr_cycles + main_rx_cycles) * 100u) / period_cycles);
+    printf("--- whole cost/frame (%lu frames): isr %lu + main %lu = %lu cycles"
+           " | cpu busy on rx %lu%% ---\r\n",
+           (unsigned long)main_rx_frames, (unsigned long)isr_pf,
+           (unsigned long)main_pf, (unsigned long)(isr_pf + main_pf),
+           (unsigned long)busy_pct);
+  }
+  main_rx_cycles  = 0u;
+  main_rx_frames  = 0u;
+  isr_cycles_mark = isr_now;
+  period_start_ms = now_ms;
 }
 
 /** Add one frame's cost to the stats of the path it took. */
