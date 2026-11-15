@@ -799,6 +799,7 @@ check:
 |---|---|
 | Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
 | Ring buffer, 2 threads | producer and consumer threads push/pop 2 000 000 descriptors under ThreadSanitizer: no lost, duplicated or torn descriptor, no data race |
+| Tools syntax | every Python script under `tools/` compiles (`py_compile`) and every shell script parses (`sh -n`), so a typo is caught before it reaches the BBB |
 | Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
 
 ## Project layout
