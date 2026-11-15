@@ -492,6 +492,9 @@ closed first). The same ~20-40 cycle offset as above appears in every run.
 
 ### Stress run 1: reception died for good at 1000 frames/s
 
+Full bug write-up (symptom, root cause, fix, lessons):
+[docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md).
+
 | | Frames |
 |---|---|
 | Sent by pktgen (all 7 steps)       | 564 000 (max step: 300 000 in 2.02 s = 148 840 frames/s, the 100 Mbit/s line rate for 64-byte frames) |
@@ -777,6 +780,7 @@ tools/bbb/nic_test.py    Scapy traffic generator, run on the BBB
 tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
 tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
 tests/                   host unit tests (parser, filter) + Makefile
+docs/bug-rx-deadlock.md  bug write-up: RX deadlock after buffer exhaustion
 .github/workflows/       CI: runs the host tests on every push
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA
 STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
