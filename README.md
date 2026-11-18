@@ -24,7 +24,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); next: polling RX (fewer interrupts), measured with the whole-cost line |
+| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); next: polling RX (fewer interrupts), measured with the whole-cost line |
 
 ## RX data path
 
@@ -727,8 +727,45 @@ Same firmware and same stress test (`sudo MAX_COUNT=1500000 sh stress.sh 0`,
   ~65 % of frames were lost in the MAC FIFO. Turn the log off with the USER
   button before any throughput test.
 
-**Still to measure:** the CPU headroom at `-O2` (edge test 2 again), and
-polling RX.
+### Phase 5, step 1b: CPU headroom at `-O2`
+
+Edge test 2 again, now on the `-O2` build: fake work per frame
+(`EXTRA_CYCLES`) is raised until frames are lost. Each value is its own
+build, set from the command line, so `main.c` is never edited for a test:
+
+```
+make -f firmware.mk OPT=-O2 EXTRA=2000   # -> build/fw-O2-x2000/STM32-SmartNIC.elf
+```
+
+Same stress (`sudo MAX_COUNT=1500000 sh stress.sh 0`, ~145 700 frames/s),
+log OFF, one PuTTY log per value (`putty_headroom_o2_x<N>.log`). At line
+rate a frame arrives every **~3 775 cycles** (550 MHz / 145 700).
+
+| `EXTRA_CYCLES` | Whole cost per frame | CPU busy | Pool found empty | Lost |
+|---|---|---|---|---|
+| 0    | 1 660 | 43 % | 12 | **0** |
+| 1000 | 2 676 | 70 % | 26 | **0** (2 runs, identical) |
+| 1500 | 3 167 | 83 % | 33 | **0** |
+| 2000 | 3 675 | 97 % | 16 576 | **0** |
+| 2500 | 3 868 | 99 % | 413 641 | 33 879 (2.3 %) |
+
+- **~2 000 cycles per frame are free at `-O2`**, against ~250-500 at `-O0`:
+  4-8x more room for real per-packet work (more rules, a TX path).
+- At +2000 the board survives on the edge: the pool is empty 16 576 times
+  and the MAC RX FIFO holds frames until a buffer is freed.
+- Over the limit it degrades gracefully, it does not die: ~142 000
+  frames/s still pass at 99 % busy, the MAC FIFO drops only the rest, and
+  every RX stall is recovered (`rbu` 82 728 = refills 82 728).
+- **Under overload the ISR got cheaper: 771 → 548 cycles per frame.** The
+  main loop is always behind, so each interrupt finds several frames and
+  pays its entry/exit cost once for all of them. Polling RX (next step)
+  does this batching on purpose, not only under overload.
+- Pitfall: CubeIDE's Debug button rebuilds and flashes its own `-O0`
+  `Debug/` build, not these files. Flash them with
+  `STM32_Programmer_CLI ... -w build/fw-O2-x<N>/STM32-SmartNIC.elf`, and
+  check the boot line `Headroom test: +N` before trusting a run.
+
+**Still to measure:** polling RX.
 
 ## BBB test link
 
@@ -816,6 +853,7 @@ identical section sizes.
 ```
 make -f firmware.mk            # -> build/fw/STM32-SmartNIC.elf (-O0; Windows: mingw32-make)
 make -f firmware.mk OPT=-O2    # -> build/fw-O2/STM32-SmartNIC.elf (optimised)
+make -f firmware.mk OPT=-O2 EXTRA=1000   # headroom test build -> build/fw-O2-x1000/
 ```
 
 Each optimisation level gets its own build folder, so object files from the

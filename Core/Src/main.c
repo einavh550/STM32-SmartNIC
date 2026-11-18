@@ -43,7 +43,9 @@
 /* CPU headroom test: fake work added to every frame, in CPU cycles.
  * 0 = normal firmware. Raise it step by step at line rate until frames
  * are lost: the last value with zero loss = cycles still free per frame. */
+#ifndef EXTRA_CYCLES               /* or from the build: -DEXTRA_CYCLES=1000u */
 #define EXTRA_CYCLES       (0u)
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/

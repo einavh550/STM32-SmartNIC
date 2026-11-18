@@ -6,6 +6,7 @@
 #
 #   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf (-O0, like CubeIDE Debug)
 #   make -f firmware.mk OPT=-O2  # optimised build in build/fw-O2/ (Phase 5 measurements)
+#   make -f firmware.mk OPT=-O2 EXTRA=1000  # headroom test build in build/fw-O2-x1000/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
@@ -18,6 +19,12 @@ ifeq ($(OPT),-O0)
 BUILD    := build/fw
 else
 BUILD    := build/fw$(OPT)
+endif
+# CPU headroom test: fake cycles per frame (main.c EXTRA_CYCLES). Each value
+# gets its own build folder too, e.g. build/fw-O2-x1000/.
+EXTRA    ?=
+ifneq ($(EXTRA),)
+BUILD    := $(BUILD)-x$(EXTRA)
 endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
@@ -33,6 +40,9 @@ S_SRCS := Core/Startup/startup_stm32h723zgtx.s
 CPU := -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
 
 DEFS := -DDEBUG -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx
+ifneq ($(EXTRA),)
+DEFS += -DEXTRA_CYCLES=$(EXTRA)u
+endif
 
 INCS := -ICore/Inc \
         -IDrivers/STM32H7xx_HAL_Driver/Inc \
