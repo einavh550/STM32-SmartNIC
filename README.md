@@ -24,7 +24,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); next: polling RX (fewer interrupts), measured with the whole-cost line |
+| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); next: more RX descriptors, a leaner RX driver than the HAL |
 
 ## RX data path
 
@@ -765,7 +765,52 @@ rate a frame arrives every **~3 775 cycles** (550 MHz / 145 700).
   `STM32_Programmer_CLI ... -w build/fw-O2-x<N>/STM32-SmartNIC.elf`, and
   check the boot line `Headroom test: +N` before trusting a run.
 
-**Still to measure:** polling RX.
+### Phase 5, step 2: NAPI-style polling RX (measured, not kept)
+
+**Idea (from Linux NAPI):** the first RX interrupt switches itself off (RIE
+in the DMA interrupt-enable register) and only wakes the main loop. Main
+reads the finished frames itself (`eth_rx_poll()`, up to 8 per pass) and
+switches the interrupt back on only when the DMA has nothing left. Under
+load, one interrupt should then pay for many frames. Re-enabling has a race
+(a frame finishing just before RI is cleared would never be announced), so
+`eth_rx_poll()` clears RI, looks once more, and only then enables RIE.
+
+Build switch: `ETH_RX_NAPI` in `eth_rx.h` (default 0 = interrupt mode),
+`make -f firmware.mk OPT=-O2 NAPI=1` → `build/fw-O2-napi/`. The stats show
+`rx irqs N | frames per irq M` and the boot line says `RX mode: ...`.
+
+All runs `-O2`, log OFF, ~145 700 frames/s (a frame every ~3 775 cycles):
+
+| Run (log) | Mode | Frames per IRQ | ISR + main = cycles/frame | CPU busy | Lost |
+|---|---|---|---|---|---|
+| Line rate, 2 064 000 frames (`putty_napi_irq.log`) | interrupt | 1 | 776 + 907 = **1 683** | 44 % | 0 |
+| Line rate, 2 064 000 frames (`putty_napi.log`) | NAPI | 1 | 142 + 1 641 = **1 783** | 47 % | 0 |
+| Overload +2 500, 1.5 M frames (`putty_headroom_o2_x2500.log`) | interrupt | ~1 | 548 + 3 320 = **3 868** | 99 % | 33 879 (2.3 %) |
+| Overload +2 500, 1.5 M frames (`putty_napi_x2500.log`) | NAPI | **16 831** | 130 + 3 910 = **4 040** | 99 % | 102 052 (**6.8 %**) |
+
+- **At line rate NAPI cannot batch.** A frame costs ~1 700 cycles but
+  arrives only every ~3 775, so main is always done before the next one:
+  still one interrupt per frame, plus the cost of switching RIE off and on.
+  Result: 6 % slower.
+- **Under overload the batching works** (30 interrupts for 505 000 frames,
+  ISR 548 → 130 cycles per frame), **but the total got worse.** The work of
+  `HAL_ETH_ReadData()` did not disappear, it moved into the main loop.
+- **Why worse: the DMA starves.** There are only 4 RX descriptors. In
+  interrupt mode the ISR preempts main and re-arms a descriptor right away.
+  With NAPI they are re-armed only when main polls, and 8 frames of work
+  (~31 000 cycles here) use up 4 descriptors long before that:
+  `rbu` 1 397 803, i.e. the DMA stopped for almost every frame and frames
+  waited in the small MAC FIFO until it overflowed.
+- **The loss is just arithmetic:** lost ≈ 1 − 3 775 / cost per frame.
+  Interrupt mode: 1 − 3 775 / 3 868 = 2.4 % (measured 2.3 %). NAPI:
+  1 − 3 775 / 4 040 = 6.6 % (measured 6.8 %). Every cycle per frame counts.
+- **Lesson:** NAPI pays off in Linux, where an interrupt is expensive
+  (context switch, cache damage). On a Cortex-M7 the interrupt entry is a
+  few dozen cycles; the real cost is the HAL driver code, and NAPI only moves
+  it. Measured before keeping it, so interrupt mode stays the default.
+- **What would help instead:** more RX descriptors (4 → 16, so the DMA can
+  run ahead of a busy CPU) and a leaner RX path than the HAL's
+  `HAL_ETH_ReadData()`.
 
 ## BBB test link
 
@@ -854,6 +899,7 @@ identical section sizes.
 make -f firmware.mk            # -> build/fw/STM32-SmartNIC.elf (-O0; Windows: mingw32-make)
 make -f firmware.mk OPT=-O2    # -> build/fw-O2/STM32-SmartNIC.elf (optimised)
 make -f firmware.mk OPT=-O2 EXTRA=1000   # headroom test build -> build/fw-O2-x1000/
+make -f firmware.mk OPT=-O2 NAPI=1       # NAPI-style polling RX -> build/fw-O2-napi/
 ```
 
 Each optimisation level gets its own build folder, so object files from the
@@ -912,7 +958,11 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - At line rate the CPU is ~96 % busy in the `-O0` build (only ~250-500
   spare cycles per frame, edge test 2) and ~43 % busy in the `-O2` build.
   The ETH ISR (mostly HAL driver code) is now the largest part of the cost.
-- Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
+- Only 4 RX DMA descriptors (CubeMX default). The NAPI test showed this is
+  too few once the CPU is busy for a while (the DMA stops, `rbu` counts it);
+  next step is to raise it.
+- NAPI-style polling RX is in the code but off by default: it measured
+  slower on this MCU (Phase 5, step 2).
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.
 - The filter is stateless (no connection tracking): ACK / FIN+ACK scans look

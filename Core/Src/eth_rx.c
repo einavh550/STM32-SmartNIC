@@ -262,12 +262,80 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
  * the CPU reacts), so drain them all. Each successful HAL_ETH_ReadData():
  * - calls HAL_ETH_RxLinkCallback() above -> frame goes into pkt_ring,
  * - refills the empty descriptor via HAL_ETH_RxAllocateCallback(). */
+static volatile uint32_t rx_irq_total;      /* written by the ETH ISR */
+
+#if ETH_RX_NAPI
+/* 1 = the ISR said "frames are waiting" and switched the RX interrupt off;
+ * main keeps polling until the DMA has nothing more. */
+static volatile uint32_t rx_poll_pending;
+#endif
+
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
 {
+    rx_irq_total++;
+
+#if ETH_RX_NAPI
+    /* NAPI-style: do NOT read here. Turn the RX interrupt off (RIE in the DMA
+     * channel's interrupt-enable register) and leave a note for main. More
+     * frames can arrive now without costing more interrupts: main reads them
+     * all in eth_rx_poll(). (The HAL already cleared RI before calling us.) */
+    __HAL_ETH_DMA_DISABLE_IT(heth, ETH_DMACIER_RIE);
+    rx_poll_pending = 1u;
+#else
     void *frame;
 
     while (HAL_ETH_ReadData(heth, &frame) == HAL_OK)
     {
         /* Nothing else to do: the link callback already queued the frame. */
     }
+#endif
+}
+
+uint32_t eth_rx_irq_count(void)
+{
+    return rx_irq_total;
+}
+
+uint32_t eth_rx_poll(uint32_t budget)
+{
+#if ETH_RX_NAPI
+    if (rx_poll_pending == 0u)
+    {
+        return 0u;                       /* interrupt mode: nothing announced */
+    }
+
+    /* Only main calls HAL_ETH_ReadData() now (the ISR does not), so no need
+     * to mask the ETH IRQ around it. Each call = one frame into pkt_ring
+     * (link callback) + a fresh buffer for its descriptor (allocate callback). */
+    uint32_t n = 0u;
+    void *frame;
+    while ((n < budget) && (HAL_ETH_ReadData(&heth, &frame) == HAL_OK))
+    {
+        n++;
+    }
+
+    if (n == budget)
+    {
+        return n;                        /* maybe more waiting: stay in polling */
+    }
+
+    /* The DMA has nothing more: go back to interrupt mode. Order matters:
+     * 1. clear RI: forget the "frame done" flag of frames we already read,
+     * 2. look ONE more time: a frame may have finished just before step 1,
+     *    and its flag was just erased -> nobody would ever announce it,
+     * 3. only if still nothing: clear the note, THEN switch RIE back on.
+     *    A frame finishing after step 1 has set RI again, so the interrupt
+     *    fires as soon as RIE is on: nothing is missed. */
+    __HAL_ETH_DMA_CLEAR_IT(&heth, ETH_DMACSR_RI | ETH_DMACSR_NIS);
+    if (HAL_ETH_ReadData(&heth, &frame) == HAL_OK)
+    {
+        return n + 1u;                   /* caught one: poll again next pass */
+    }
+    rx_poll_pending = 0u;
+    __HAL_ETH_DMA_ENABLE_IT(&heth, ETH_DMACIER_RIE);
+    return n;
+#else
+    (void)budget;
+    return 0u;                           /* old mode: the ISR reads the frames */
+#endif
 }

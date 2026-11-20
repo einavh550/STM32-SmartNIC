@@ -23,6 +23,23 @@
  *  16 x 1536 = 24 KB, which fits in the 32 KB of D2 SRAM next to the descriptors. */
 #define ETH_RX_BUF_COUNT    (16u)
 
+/** RX mode (Phase 5, step 2).
+ *  1 = NAPI-style polling: the ETH interrupt only wakes the main loop and
+ *      switches itself off; main reads the frames (eth_rx_poll()) and turns
+ *      the interrupt back on when nothing is left.
+ *  0 = interrupt mode (DEFAULT): the ISR reads every frame itself.
+ *  Measured (README, Phase 5 step 2): NAPI is SLOWER on this MCU (1783 vs
+ *  1683 cycles/frame at line rate; 6.8 % vs 2.3 % loss under overload),
+ *  because a Cortex-M7 interrupt is cheap and with only 4 RX descriptors the
+ *  DMA starves while main is busy. Kept as an option: make ... NAPI=1 */
+#ifndef ETH_RX_NAPI
+#define ETH_RX_NAPI         (0)
+#endif
+
+/** Most frames eth_rx_poll() reads in one call, so a flood cannot keep the
+ *  main loop away from its other work (stats, button) forever. */
+#define ETH_RX_POLL_BUDGET  (8u)
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                */
 /* ------------------------------------------------------------------------- */
@@ -90,5 +107,15 @@ void eth_rx_get_stats(eth_rx_stats_t *out);
  *  then start a new period. The "free bufs" number above is only a snapshot
  *  at print time; this is the real low point in between. */
 uint32_t eth_rx_take_period_low(void);
+
+/** Main loop: read up to ETH_RX_POLL_BUDGET finished frames into the packet
+ *  ring (then eth_rx_pop() them as before). Does nothing until the ETH
+ *  interrupt has said "work is waiting". Returns the number of frames read.
+ *  In the old mode (ETH_RX_NAPI 0) it always returns 0: the ISR reads. */
+uint32_t eth_rx_poll(uint32_t budget);
+
+/** RX interrupts taken since boot. frames / irqs = how many frames one
+ *  interrupt paid for (batching). */
+uint32_t eth_rx_irq_count(void);
 
 #endif /* INC_ETH_RX_H_ */

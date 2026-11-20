@@ -107,6 +107,7 @@ static perf_stats_t path_limit[POLICY_RULE_COUNT];
  * ISR time that interrupted it taken out, so nothing is counted twice. */
 static uint64_t main_rx_cycles;    /* main-loop RX work, ISR time removed */
 static uint32_t main_rx_frames;    /* frames handled in this period */
+static uint32_t irq_mark;          /* eth_rx_irq_count() at period start */
 static uint32_t isr_cycles_mark;   /* perf_eth_isr_cycles at period start */
 static uint32_t period_start_ms;   /* HAL_GetTick() at period start */
 /* USER CODE END PV */
@@ -277,6 +278,7 @@ int main(void)
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
   printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
+  printf("RX mode: %s\r\n", (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame");
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 
@@ -295,7 +297,12 @@ int main(void)
     time_snapshot(&work_t0, &work_isr);
     uint32_t frames_now = 0u;   /* frames handled in this loop pass */
 
-    /* Consumer side: take every frame the ISR queued, then give the buffer back. */
+    /* NAPI mode: main reads the finished frames from the DMA itself (up to
+     * a budget) into the packet ring. Inside the timed window, so the HAL
+     * time that moved out of the ISR is still counted. */
+    (void)eth_rx_poll(ETH_RX_POLL_BUDGET);
+
+    /* Consumer side: take every frame queued, then give the buffer back. */
     while (eth_rx_pop(&pkt))
     {
       frames_now++;
@@ -673,7 +680,12 @@ static void print_stats(void)
            (unsigned long)main_rx_frames, (unsigned long)isr_pf,
            (unsigned long)main_pf, (unsigned long)(isr_pf + main_pf),
            (unsigned long)busy_pct);
+    /* Batching: how many frames one RX interrupt paid for this period. */
+    uint32_t irqs = eth_rx_irq_count() - irq_mark;
+    printf("--- rx irqs %lu | frames per irq %lu ---\r\n", (unsigned long)irqs,
+           (unsigned long)((irqs != 0u) ? (main_rx_frames / irqs) : 0u));
   }
+  irq_mark = eth_rx_irq_count();
   main_rx_cycles  = 0u;
   main_rx_frames  = 0u;
   isr_cycles_mark = isr_now;

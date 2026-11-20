@@ -7,6 +7,7 @@
 #   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf (-O0, like CubeIDE Debug)
 #   make -f firmware.mk OPT=-O2  # optimised build in build/fw-O2/ (Phase 5 measurements)
 #   make -f firmware.mk OPT=-O2 EXTRA=1000  # headroom test build in build/fw-O2-x1000/
+#   make -f firmware.mk OPT=-O2 NAPI=1      # NAPI-style polling RX in build/fw-O2-napi/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
@@ -26,6 +27,12 @@ EXTRA    ?=
 ifneq ($(EXTRA),)
 BUILD    := $(BUILD)-x$(EXTRA)
 endif
+# RX mode (eth_rx.h ETH_RX_NAPI): empty = default (interrupt mode),
+# 1 = NAPI-style polling in its own folder (measured slower, kept to compare).
+NAPI     ?=
+ifeq ($(NAPI),1)
+BUILD    := $(BUILD)-napi
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -42,6 +49,9 @@ CPU := -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
 DEFS := -DDEBUG -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx
 ifneq ($(EXTRA),)
 DEFS += -DEXTRA_CYCLES=$(EXTRA)u
+endif
+ifneq ($(NAPI),)
+DEFS += -DETH_RX_NAPI=$(NAPI)
 endif
 
 INCS := -ICore/Inc \
