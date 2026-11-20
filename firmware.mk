@@ -8,6 +8,7 @@
 #   make -f firmware.mk OPT=-O2  # optimised build in build/fw-O2/ (Phase 5 measurements)
 #   make -f firmware.mk OPT=-O2 EXTRA=1000  # headroom test build in build/fw-O2-x1000/
 #   make -f firmware.mk OPT=-O2 NAPI=1      # NAPI-style polling RX in build/fw-O2-napi/
+#   make -f firmware.mk OPT=-O2 LEAN=0      # ST HAL RX path (no lean driver) in build/fw-O2-hal/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
@@ -33,6 +34,12 @@ NAPI     ?=
 ifeq ($(NAPI),1)
 BUILD    := $(BUILD)-napi
 endif
+# RX driver (eth_rx.h ETH_RX_LEAN): empty = default (lean driver),
+# 0 = the ST HAL path in its own folder, for the before/after numbers.
+LEAN     ?=
+ifeq ($(LEAN),0)
+BUILD    := $(BUILD)-hal
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -52,6 +59,9 @@ DEFS += -DEXTRA_CYCLES=$(EXTRA)u
 endif
 ifneq ($(NAPI),)
 DEFS += -DETH_RX_NAPI=$(NAPI)
+endif
+ifneq ($(LEAN),)
+DEFS += -DETH_RX_LEAN=$(LEAN)
 endif
 
 INCS := -ICore/Inc \

@@ -40,6 +40,15 @@
  *  main loop away from its other work (stats, button) forever. */
 #define ETH_RX_POLL_BUDGET  (8u)
 
+/** RX driver (Phase 5, step 3).
+ *  1 = lean driver (DEFAULT): our own short loop reads finished descriptors
+ *      and re-arms them; HAL_ETH_ReadData() is not used after start-up.
+ *  0 = the ST HAL path (HAL_ETH_ReadData + callbacks), kept to compare.
+ *      Build: make ... LEAN=0 */
+#ifndef ETH_RX_LEAN
+#define ETH_RX_LEAN         (1)
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                */
 /* ------------------------------------------------------------------------- */
@@ -49,6 +58,13 @@
  * @note   Call once from main AFTER MX_ETH_Init() and BEFORE HAL_ETH_Start_IT().
  */
 void eth_rx_init(void);
+
+/**
+ * @brief  Start the ETH MAC + DMA with RX interrupts (wraps HAL_ETH_Start_IT())
+ *         and, in lean mode, take over the RX descriptor ring from the HAL.
+ * @note   Call once from main after eth_rx_init(). Returns false on error.
+ */
+bool eth_rx_start(void);
 
 /**
  * @brief  Give a buffer back to the pool after the frame in it was processed.

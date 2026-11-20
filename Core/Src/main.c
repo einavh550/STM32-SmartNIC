@@ -229,8 +229,9 @@ int main(void)
   /* Start Ethernet RX. Done here (not in USER CODE 2) so the COM port is
    * already up and printf works. Order matters:
    * 1. eth_rx_init() fills the free list,
-   * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
-   *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
+   * 2. eth_rx_start() -> HAL_ETH_Start_IT() takes 4 buffers for the
+   *    descriptors (via HAL_ETH_RxAllocateCallback) and enables the ETH DMA
+   *    interrupts; the lean driver then takes the descriptor ring over. */
   if (!pkt_filter_init(&filter, filter_policy, POLICY_RULE_COUNT, POLICY_DEFAULT_ACTION))
   {
     printf("Invalid filter policy\r\n");
@@ -256,7 +257,7 @@ int main(void)
   }
 
   eth_rx_init();
-  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+  if (!eth_rx_start())   /* HAL_ETH_Start_IT() + lean driver takeover */
   {
     printf("ETH start failed\r\n");
     Error_Handler();
@@ -278,7 +279,8 @@ int main(void)
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
   printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
-  printf("RX mode: %s\r\n", (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame");
+  printf("RX mode: %s, %s driver\r\n", (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame",
+         (ETH_RX_LEAN != 0) ? "lean" : "HAL");
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 

@@ -122,6 +122,7 @@ static uint16_t rx_csum_flags(const uint8_t *buff)
 
 static void note_free_count(uint32_t n);   /* low-water marks, see below */
 static volatile uint32_t pool_empty_total; /* allocations that found the pool empty */
+static uint32_t rx_harvest(uint32_t budget); /* read finished frames, see below */
 
 /* The HAL calls this when an RX descriptor needs an empty buffer.
  * Returning NULL is allowed: the HAL leaves that descriptor empty and
@@ -186,29 +187,27 @@ uint32_t eth_rx_take_period_low(void)
     return low;
 }
 
+static bool rx_ring_full(void);           /* every descriptor has a buffer? */
+
 void eth_rx_refill(void)
 {
-    /* RxBuildDescCnt = descriptors the HAL still has to give a buffer to.
-     * 0 in normal operation (the ISR refills at once). One aligned 32-bit
-     * read is atomic; if the ISR changes it right after, we just act one
-     * loop pass later. */
-    if (heth.RxDescList.RxBuildDescCnt == 0u)
+    /* 0 descriptors waiting for a buffer is normal operation (the ISR
+     * refills at once). One aligned 32-bit read is atomic; if the ISR
+     * changes it right after, we just act one loop pass later. */
+    if (rx_ring_full())
     {
         return;
     }
 
-    /* HAL_ETH_ReadData() rebuilds the empty descriptors from free_ring and
-     * writes the DMA tail pointer, which resumes a suspended DMA. It also
-     * reads any frame already finished (-> pkt_ring). The ISR calls it too,
-     * and the HAL's descriptor bookkeeping is not reentrant, so keep the ETH
-     * interrupt off meanwhile (at most 4 descriptors: a few microseconds).
-     * With the interrupt off, main is the only producer of pkt_ring for
-     * that moment, so the ring stays single-producer. */
+    /* rx_harvest() re-arms the empty descriptors from free_ring and writes
+     * the DMA tail pointer, which resumes a suspended DMA. It also reads any
+     * frame already finished (-> pkt_ring). The ISR calls it too, and the
+     * descriptor bookkeeping is not reentrant, so keep the ETH interrupt off
+     * meanwhile (at most 4 descriptors: a few microseconds). With the
+     * interrupt off, main is the only producer of pkt_ring for that moment,
+     * so the ring stays single-producer. */
     HAL_NVIC_DisableIRQ(ETH_IRQn);
-    void *frame;
-    while (HAL_ETH_ReadData(&heth, &frame) == HAL_OK)
-    {
-    }
+    (void)rx_harvest(UINT32_MAX);
     HAL_NVIC_EnableIRQ(ETH_IRQn);
 
     refill_total++;
@@ -259,9 +258,8 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 /* Called from ETH_IRQHandler -> HAL_ETH_IRQHandler() when the DMA has
  * received at least one frame. Runs in INTERRUPT context: keep it short.
  * One interrupt can stand for several frames (they may arrive faster than
- * the CPU reacts), so drain them all. Each successful HAL_ETH_ReadData():
- * - calls HAL_ETH_RxLinkCallback() above -> frame goes into pkt_ring,
- * - refills the empty descriptor via HAL_ETH_RxAllocateCallback(). */
+ * the CPU reacts), so drain them all with rx_harvest() (bottom of file):
+ * every finished frame goes into pkt_ring and its descriptor is re-armed. */
 static volatile uint32_t rx_irq_total;      /* written by the ETH ISR */
 
 #if ETH_RX_NAPI
@@ -282,12 +280,8 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
     __HAL_ETH_DMA_DISABLE_IT(heth, ETH_DMACIER_RIE);
     rx_poll_pending = 1u;
 #else
-    void *frame;
-
-    while (HAL_ETH_ReadData(heth, &frame) == HAL_OK)
-    {
-        /* Nothing else to do: the link callback already queued the frame. */
-    }
+    (void)heth;
+    (void)rx_harvest(UINT32_MAX);        /* every finished frame -> pkt_ring */
 #endif
 }
 
@@ -304,15 +298,10 @@ uint32_t eth_rx_poll(uint32_t budget)
         return 0u;                       /* interrupt mode: nothing announced */
     }
 
-    /* Only main calls HAL_ETH_ReadData() now (the ISR does not), so no need
-     * to mask the ETH IRQ around it. Each call = one frame into pkt_ring
-     * (link callback) + a fresh buffer for its descriptor (allocate callback). */
-    uint32_t n = 0u;
-    void *frame;
-    while ((n < budget) && (HAL_ETH_ReadData(&heth, &frame) == HAL_OK))
-    {
-        n++;
-    }
+    /* Only main reads frames now (the ISR does not), so no need to mask the
+     * ETH IRQ around it. Each frame goes into pkt_ring and its descriptor
+     * gets a fresh buffer. */
+    uint32_t n = rx_harvest(budget);
 
     if (n == budget)
     {
@@ -327,7 +316,7 @@ uint32_t eth_rx_poll(uint32_t budget)
      *    A frame finishing after step 1 has set RI again, so the interrupt
      *    fires as soon as RIE is on: nothing is missed. */
     __HAL_ETH_DMA_CLEAR_IT(&heth, ETH_DMACSR_RI | ETH_DMACSR_NIS);
-    if (HAL_ETH_ReadData(&heth, &frame) == HAL_OK)
+    if (rx_harvest(1u) != 0u)
     {
         return n + 1u;                   /* caught one: poll again next pass */
     }
@@ -339,3 +328,187 @@ uint32_t eth_rx_poll(uint32_t budget)
     return 0u;                           /* old mode: the ISR reads the frames */
 #endif
 }
+
+/* ------------------------------------------------------------------------- */
+/* Reading finished frames: lean driver or HAL                               */
+/* ------------------------------------------------------------------------- */
+
+#if ETH_RX_LEAN
+
+/* Why our own loop: HAL_ETH_ReadData() is general (frames split over several
+ * descriptors, timestamps, polling mode, a callback per step) and reads the
+ * same descriptor word many times. Every descriptor read goes to D2 SRAM,
+ * which is non-cacheable (MPU region 1), so each one is a slow bus access.
+ * Our case is simpler: one 1536-byte buffer always holds a whole frame and
+ * timestamps are off. So per frame: read DESC3 once, read DESC1 once, write
+ * the descriptor back with a new buffer, and move the tail pointer.
+ *
+ * Ring state. The HAL builds the ring in HAL_ETH_Start_IT(); eth_rx_start()
+ * then copies its state here and the HAL never touches the ring again.
+ *   rx_next  = next descriptor the DMA will finish (we read from here),
+ *   rx_build = next descriptor that needs a buffer (we arm from here),
+ *   rx_armed = descriptors holding a buffer, owned by the DMA.
+ * rx_desc_buf[] remembers which buffer each descriptor holds. It lives in
+ * normal (cached) RAM, so looking it up is fast, unlike BackupAddr0 in D2.
+ * Only the ETH ISR, or main with the ETH IRQ masked, runs this code. */
+static uint8_t *rx_desc_buf[ETH_RX_DESC_CNT];
+static uint32_t rx_next;
+static uint32_t rx_build;
+static volatile uint32_t rx_armed;       /* main reads it in eth_rx_refill() */
+
+static inline uint32_t rx_idx_next(uint32_t i)
+{
+    return (i + 1u == ETH_RX_DESC_CNT) ? 0u : (i + 1u);
+}
+
+/* Give a free buffer to every descriptor that has none, then tell the DMA. */
+static void rx_arm(void)
+{
+    uint32_t armed = rx_armed;
+    const uint32_t before = armed;
+    uint32_t last = rx_build;
+
+    while (armed < ETH_RX_DESC_CNT)
+    {
+        pkt_desc_t d;
+        if (!rb_pop(&free_ring, &d))
+        {
+            pool_empty_total++;          /* pool empty: try again later */
+            note_free_count(0u);
+            break;
+        }
+        note_free_count(rb_count(&free_ring));
+
+        ETH_DMADescTypeDef *desc = &heth.Init.RxDesc[rx_build];
+        rx_desc_buf[rx_build] = d.data;
+        desc->DESC0 = (uint32_t)d.data;  /* buffer 1 address */
+        /* The DMA must see the address BEFORE it sees OWN. D2 SRAM is
+         * "normal" memory, where the CPU may reorder stores: force order. */
+        __DMB();
+        desc->DESC3 = ETH_DMARXNDESCRF_OWN | ETH_DMARXNDESCRF_BUF1V | ETH_DMARXNDESCRF_IOC;
+
+        last     = rx_build;
+        rx_build = rx_idx_next(rx_build);
+        armed++;
+    }
+
+    if (armed != before)
+    {
+        rx_armed = armed;
+        /* Tail pointer = last descriptor the DMA may use. Writing it also
+         * wakes a DMA that stopped for lack of buffers (RBU). */
+        __DMB();
+        heth.Instance->DMACRDTPR = (uint32_t)&heth.Init.RxDesc[last];
+    }
+}
+
+/* Read up to `budget` finished frames into pkt_ring, then re-arm the ring.
+ * Returns the number of frames read. */
+static uint32_t rx_harvest(uint32_t budget)
+{
+    uint32_t n = 0u;
+    uint32_t armed = rx_armed;
+
+    while ((n < budget) && (armed > 0u))
+    {
+        const ETH_DMADescTypeDef *desc = &heth.Init.RxDesc[rx_next];
+        const uint32_t d3 = desc->DESC3; /* ONE read of the write-back word */
+
+        if ((d3 & ETH_DMARXNDESCWBF_OWN) != 0u)
+        {
+            break;                       /* the DMA still owns it: no more frames */
+        }
+
+        pkt_desc_t d = { .data = rx_desc_buf[rx_next], .len = 0u, .flags = 0u };
+
+        /* Normal case: the whole frame in this one descriptor (first and
+         * last), not a context (timestamp) descriptor. */
+        if ((d3 & (ETH_DMARXNDESCWBF_FD | ETH_DMARXNDESCWBF_LD | ETH_DMARXNDESCWBF_CTXT))
+            == (ETH_DMARXNDESCWBF_FD | ETH_DMARXNDESCWBF_LD))
+        {
+            d.len = (uint16_t)(d3 & ETH_DMARXNDESCWBF_PL);
+            if ((d3 & ETH_DMARXNDESCWBF_RS1V) != 0u)  /* DESC1 holds a valid report */
+            {
+                const uint32_t d1 = desc->DESC1;
+                if ((d1 & ETH_DMARXNDESCWBF_IPHE) != 0u)
+                {
+                    d.flags |= PKT_FLAG_IP_HDR_ERR;
+                }
+                if ((d1 & ETH_DMARXNDESCWBF_IPCE) != 0u)
+                {
+                    d.flags |= PKT_FLAG_IP_PAYLOAD_ERR;
+                }
+            }
+        }
+        /* else: cannot happen with whole-frame buffers and timestamps off.
+         * If it ever does, the buffer still goes to main with len 0: the
+         * parser counts it as malformed and main frees it as usual. */
+
+        (void)rb_push(&pkt_ring, &d);    /* cannot fail: see _Static_assert above */
+        rx_desc_buf[rx_next] = NULL;
+        rx_next = rx_idx_next(rx_next);
+        armed--;
+        n++;
+    }
+
+    rx_armed = armed;
+    rx_arm();
+    return n;
+}
+
+static bool rx_ring_full(void)
+{
+    return rx_armed == ETH_RX_DESC_CNT;
+}
+
+bool eth_rx_start(void)
+{
+    /* Keep the ETH interrupt off until the takeover below is done, so the
+     * first RX interrupt already finds our state. A frame that arrives in
+     * between just stays pending and is handled right after. */
+    HAL_NVIC_DisableIRQ(ETH_IRQn);
+    const bool ok = (HAL_ETH_Start_IT(&heth) == HAL_OK);
+
+    /* HAL_ETH_Start_IT() armed the descriptors with our buffers (through
+     * HAL_ETH_RxAllocateCallback); each one remembers its buffer in
+     * BackupAddr0. Copy that state, then the HAL never touches RX again. */
+    for (uint32_t i = 0u; i < ETH_RX_DESC_CNT; i++)
+    {
+        rx_desc_buf[i] = (uint8_t *)heth.Init.RxDesc[i].BackupAddr0;
+    }
+    rx_next  = heth.RxDescList.RxDescIdx;
+    rx_build = heth.RxDescList.RxBuildDescIdx;
+    rx_armed = ETH_RX_DESC_CNT - heth.RxDescList.RxBuildDescCnt;
+
+    HAL_NVIC_EnableIRQ(ETH_IRQn);
+    return ok;
+}
+
+#else /* !ETH_RX_LEAN: the ST HAL path */
+
+/* Each successful HAL_ETH_ReadData() calls HAL_ETH_RxLinkCallback() (frame ->
+ * pkt_ring) and refills the descriptor via HAL_ETH_RxAllocateCallback(). It
+ * also re-arms starved descriptors even when no frame is waiting. */
+static uint32_t rx_harvest(uint32_t budget)
+{
+    uint32_t n = 0u;
+    void *frame;
+    while ((n < budget) && (HAL_ETH_ReadData(&heth, &frame) == HAL_OK))
+    {
+        n++;
+    }
+    return n;
+}
+
+static bool rx_ring_full(void)
+{
+    /* RxBuildDescCnt = descriptors the HAL still has to give a buffer to. */
+    return heth.RxDescList.RxBuildDescCnt == 0u;
+}
+
+bool eth_rx_start(void)
+{
+    return HAL_ETH_Start_IT(&heth) == HAL_OK;
+}
+
+#endif /* ETH_RX_LEAN */
