@@ -40,6 +40,12 @@
 /* USER CODE BEGIN PD */
 #define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
 #define BUTTON_DEBOUNCE_MS (200u)   /* ignore button bounces closer than this */
+/* Most frames one main-loop pass handles before it does its other work
+ * (refill, button, stats) and starts a new pass. Without a limit, sustained
+ * overload kept main in the RX loop for a whole 10 s burst: the stats print
+ * waited, and that pass's 32-bit cycle delta wrapped (Phase 5, step 3b).
+ * 16 = the whole pool: at most one full pkt_ring per pass. */
+#define MAIN_RX_BUDGET    (ETH_RX_BUF_COUNT)
 /* CPU headroom test: fake work added to every frame, in CPU cycles.
  * 0 = normal firmware. Raise it step by step at line rate until frames
  * are lost: the last value with zero loss = cycles still free per frame. */
@@ -306,8 +312,11 @@ int main(void)
      * time that moved out of the ISR is still counted. */
     (void)eth_rx_poll(ETH_RX_POLL_BUDGET);
 
-    /* Consumer side: take every frame queued, then give the buffer back. */
-    while (eth_rx_pop(&pkt))
+    /* Consumer side: take the queued frames (at most MAIN_RX_BUDGET, so the
+     * rest of the loop still runs under overload), then give each buffer
+     * back. Budget checked FIRST, so no frame is popped and then skipped;
+     * frames left over stay in pkt_ring for the next pass. */
+    while ((frames_now < MAIN_RX_BUDGET) && eth_rx_pop(&pkt))
     {
       frames_now++;
       /* Parse, drop if malformed or the MAC reported a checksum error, else

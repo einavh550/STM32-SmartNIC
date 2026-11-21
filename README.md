@@ -24,7 +24,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy) |
+| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
 
 ## RX data path
 
@@ -929,8 +929,35 @@ tags as before.
   (1) the 5 s stats print was skipped until the burst ended, and (2) the
   32-bit cycle delta of that one main-loop pass wrapped (2^32 cycles =
   7.8 s): the raw line said `main 420`. Corrected: 420 + 2^32 / 1 454 589
-  frames = 3 373. Same root cause for both: the RX loop has no per-pass
-  limit (see Known limitations).
+  frames = 3 373. Same root cause for both: the RX loop had no per-pass
+  limit, fixed in step 3c.
+
+### Phase 5, step 3c: frame budget per main-loop pass
+
+**Fix (`main.c`, `MAIN_RX_BUDGET` = 16, the whole pool):** one main-loop
+pass handles at most 16 frames, then does its other work (refill, button,
+MAC drop counters, stats) and starts a new pass. The budget is checked
+before `eth_rx_pop()`, so no frame is popped and then skipped. Frames left
+over wait in `pkt_ring`. At line rate a pass sees ~1 frame, so only
+overload is affected.
+
+**Test:** same overload as step 3b (`putty_budget_x2500.log`, +2 500 extra
+cycles, 1.5 M frames, log OFF):
+
+| | Step 3b (no budget) | Step 3c (budget 16) |
+|---|---|---|
+| Stats lines during the ~10 s burst | 1, after the burst | 3, on time (609 k / 729 k / 162 k frames) |
+| main cycles/frame (raw line) | 420 (wrapped) | 3 383-3 389 (real) |
+| Whole cost/frame | 3 744-3 773 | 3 743-3 763 |
+| Lost / FIFO overflow | 0 / 0 | 0 / 0 |
+| Pool found empty / `rbu` / main-loop refills | 1 454 479 / 300 674 / 12 | 309 864 / 90 495 / 18 262 |
+
+- The stats print and the button now run during overload, and the cost
+  numbers are real (no wrap). The extra work every 16 frames costs nothing
+  measurable (whole cost unchanged).
+- Bonus: main now re-arms descriptors every 16 frames (refills 12 →
+  18 262), so the DMA stopped for lack of a buffer 3x less often (`rbu`
+  300 674 → 90 495).
 
 ## BBB test link
 
@@ -1080,10 +1107,6 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - At line rate the CPU is ~96 % busy in the `-O0` build (only ~250-500
   spare cycles per frame, edge test 2), ~43 % in the `-O2` build and ~33 %
   with the lean RX driver and our own ETH interrupt handler.
-- The main loop's RX loop has no per-pass limit: under sustained overload it
-  never exits, so the stats print and the USER button wait until the burst
-  ends, and a pass longer than 7.8 s overflows its 32-bit cycle delta
-  (Phase 5, step 3b). A per-pass frame budget would fix both.
 - Our ETH interrupt handler assumes only DMA interrupts are enabled; any
   other source is passed to `HAL_ETH_IRQHandler()`.
 - Only 4 RX DMA descriptors (CubeMX default; `ETH_RX_DESC_CNT` sits in a
