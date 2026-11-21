@@ -8,6 +8,34 @@ loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers and runs
 them through a first-match rule filter.
 A BeagleBone Black on the other end of the cable acts as the traffic generator.
 
+## Results at a glance
+
+Measured on the board at 550 MHz, 100 Mbit/s line rate with 60-byte frames
+(~145 700 frames/s, one frame every ~3 775 CPU cycles), per-frame log off:
+
+| Build / change | ISR + main = cycles per frame | CPU busy | Lost at line rate |
+|---|---|---|---|
+| `-O0`, ST HAL RX path | 3 656 | ~96 % | 0 |
+| `-O2` | 1 660 | ~43 % | 0 |
+| + lean RX descriptor driver (replaces `HAL_ETH_ReadData()`) | 429 + 901 = 1 330 | 35 % | 0 |
+| + own ETH interrupt handler (one `DMACSR` read) | **357 + 902 = 1 259** | **33 %** | **0** |
+
+- **2.9x less CPU per frame** overall. The ISR went from 776 to 357 cycles
+  at `-O2`. Filter cost per frame was cross-checked with a logic analyzer
+  (GPIO pulse vs. DWT cycle counter).
+- **~2 500 spare cycles per frame**: 1.5 M frames with +2 500 fake cycles
+  per frame are still received with 0 loss. The HAL RX path lost 2.3 % there.
+- **Tried and measured, not kept:** NAPI-style polling RX was 6 % slower at
+  line rate and lost 6.8 % under overload on this MCU (a Cortex-M7 interrupt
+  is cheap). Kept as a build option, with the numbers.
+- **Bugs found by stress testing and fixed:** an RX deadlock after buffer
+  exhaustion ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)), and a
+  main loop that never left its RX loop under overload (Phase 5, step 3c).
+- Filter: malformed / spoofed / TCP-scan / bad-checksum frames dropped and
+  counted, floods rate-limited. Host unit tests + firmware build in CI.
+
+Details of every measurement are under [Performance](#performance).
+
 ## Hardware
 
 | Part             | Role                                                      |
@@ -24,7 +52,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | In progress: `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
+| 5     | Profiling, throughput limits, hardening       | Done (summary in [Results at a glance](#results-at-a-glance)): `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
 
 ## RX data path
 
