@@ -10,6 +10,7 @@
 #   make -f firmware.mk OPT=-O2 NAPI=1      # NAPI-style polling RX in build/fw-O2-napi/
 #   make -f firmware.mk OPT=-O2 LEAN=0      # ST HAL RX path (no lean driver) in build/fw-O2-hal/
 #   make -f firmware.mk OPT=-O2 OWNIRQ=0    # lean driver + HAL_ETH_IRQHandler in build/fw-O2-halirq/
+#   make -f firmware.mk OPT=-O2 REFLECT=0   # no TX reflect (RX only) in build/fw-O2-noreflect/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
@@ -47,6 +48,12 @@ OWNIRQ   ?=
 ifeq ($(OWNIRQ),0)
 BUILD    := $(BUILD)-halirq
 endif
+# Phase 6 reflect (main.c TX_REFLECT): empty = default (on), 0 = off, in its
+# own folder (RX-only behaviour, to compare the cost).
+REFLECT  ?=
+ifeq ($(REFLECT),0)
+BUILD    := $(BUILD)-noreflect
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -72,6 +79,9 @@ DEFS += -DETH_RX_LEAN=$(LEAN)
 endif
 ifneq ($(OWNIRQ),)
 DEFS += -DETH_RX_OWN_IRQ=$(OWNIRQ)
+endif
+ifneq ($(REFLECT),)
+DEFS += -DTX_REFLECT=$(REFLECT)
 endif
 
 INCS := -ICore/Inc \
