@@ -65,6 +65,15 @@ void eth_rx_buf_free(uint8_t *buf)
     (void)rb_push(&free_ring, &d);       /* cannot fail: at most 16 buffers exist */
 }
 
+bool eth_rx_buf_is_pool(const uint8_t *buf)
+{
+    /* Inside the pool array and at the start of one of its buffers. */
+    const uintptr_t p     = (uintptr_t)buf;
+    const uintptr_t start = (uintptr_t)&rx_pool[0][0];
+    return (p >= start) && (p < start + sizeof rx_pool) &&
+           (((p - start) % ETH_RX_BUF_SIZE) == 0u);
+}
+
 bool eth_rx_pop(pkt_desc_t *out)
 {
     return rb_pop(&pkt_ring, out);

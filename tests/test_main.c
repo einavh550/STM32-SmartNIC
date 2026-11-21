@@ -13,6 +13,7 @@ int tf_failures = 0;
 void run_pkt_parse_tests(void);
 void run_pkt_filter_tests(void);
 void run_filter_policy_tests(void);
+void run_pkt_reflect_tests(void);
 
 int main(void)
 {
@@ -24,6 +25,9 @@ int main(void)
 
     printf("== filter_policy ==\n");
     run_filter_policy_tests();
+
+    printf("== pkt_reflect ==\n");
+    run_pkt_reflect_tests();
 
     printf("\n%d checks, %d failed: %s\n", tf_checks, tf_failures,
            (tf_failures == 0) ? "PASS" : "FAIL");

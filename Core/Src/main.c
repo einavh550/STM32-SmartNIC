@@ -24,6 +24,8 @@
 /* USER CODE BEGIN Includes */
 #include "ring_buffer_test.h"
 #include "eth_rx.h"
+#include "eth_tx.h"
+#include "pkt_reflect.h"
 #include "pkt_parse.h"
 #include "pkt_filter.h"
 #include "filter_policy.h"
@@ -46,6 +48,12 @@
  * waited, and that pass's 32-bit cycle delta wrapped (Phase 5, step 3b).
  * 16 = the whole pool: at most one full pkt_ring per pass. */
 #define MAIN_RX_BUDGET    (ETH_RX_BUF_COUNT)
+/* Phase 6: 1 = every UDP frame that passed the filter goes back to its
+ * sender (pkt_reflect.c), zero-copy from the same buffer; 0 = consume all
+ * frames as before. Build: make ... REFLECT=0 */
+#ifndef TX_REFLECT
+#define TX_REFLECT        (1)
+#endif
 /* CPU headroom test: fake work added to every frame, in CPU cycles.
  * 0 = normal firmware. Raise it step by step at line rate until frames
  * are lost: the last value with zero loss = cycles still free per frame. */
@@ -116,6 +124,8 @@ static uint32_t main_rx_frames;    /* frames handled in this period */
 static uint32_t irq_mark;          /* eth_rx_irq_count() at period start */
 static uint32_t isr_cycles_mark;   /* perf_eth_isr_cycles at period start */
 static uint32_t period_start_ms;   /* HAL_GetTick() at period start */
+
+static uint32_t tx_reflected;      /* passed UDP frames sent back (Phase 6) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -269,6 +279,10 @@ int main(void)
     Error_Handler();
   }
   printf("ETH RX started\r\n");
+  eth_tx_init();         /* TX ring: ours from now on (main loop only) */
+  printf("ETH TX ready: test frame every %u s (UDP broadcast to port 5001), reflect %s\r\n",
+         (unsigned)(STATS_PERIOD_MS / 1000u),
+         (TX_REFLECT != 0) ? "ON (passed UDP frames go back to the sender)" : "OFF");
   /* Read back from the RCC registers: proves the PLL really runs (550 MHz). */
   printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
   perf_init();
@@ -349,9 +363,34 @@ int main(void)
         log_frame(&pkt, &hdr, v);
       }
 
-      /* Always give the buffer back, even for a dropped frame, or the pool leaks. */
-      eth_rx_buf_free(pkt.data);
+      /* Phase 6 reflect, zero-copy: a passed UDP frame is rewritten in place
+       * (after the log, which shows it as received) and the SAME buffer goes
+       * to the TX DMA. It then belongs to TX: eth_tx_reclaim() gives it
+       * back to the pool once sent. TX ring full: dropped, counted as tx
+       * busy, freed below like any other frame. */
+      bool to_tx = false;
+      if ((TX_REFLECT != 0) && (v.action == PKT_PASS) &&
+          pkt_reflect_udp(pkt.data, pkt.len, &hdr, heth.Init.MACAddr, POLICY_BOARD_IP))
+      {
+        to_tx = eth_tx_send(pkt.data, pkt.len);
+        if (to_tx)
+        {
+          tx_reflected++;
+        }
+      }
+
+      /* Every other buffer goes back now, even for a dropped frame, or the
+       * pool leaks. */
+      if (!to_tx)
+      {
+        eth_rx_buf_free(pkt.data);
+      }
     }
+
+    /* Collect sent frames: their buffers return to the pool, and the TX
+     * descriptors are free again. Inside the timed window: TX work is part
+     * of the cost of a frame now. */
+    (void)eth_tx_reclaim();
 
     /* Buffers were just freed: hand them to any RX descriptor left without
      * one, and wake the DMA if it stopped (see eth_rx_refill()). */
@@ -370,12 +409,19 @@ int main(void)
 
     handle_button();
     eth_rx_poll_hw();   /* collect the MAC's clear-on-read drop counters */
+    (void)eth_tx_reclaim();   /* also when idle: the last frames of a burst */
 
     /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
     if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
     {
       last_stats_ms = HAL_GetTick();
       print_stats();
+      /* Phase 6 step 1: one test frame per stats period proves TX works. */
+      static uint32_t tx_test_seq;
+      if (eth_tx_send_test(tx_test_seq))
+      {
+        tx_test_seq++;
+      }
     }
   }
   /* USER CODE END 3 */
@@ -660,6 +706,15 @@ static void print_stats(void)
          (unsigned)ETH_RX_BUF_COUNT, (unsigned long)eth_rx_take_period_low(),
          (unsigned long)hw.free_low, (unsigned long)hw.pool_empty,
          (unsigned long)uart_log_dropped());
+
+  /* TX (Phase 6): handed to the DMA / finished / refused (ring full) /
+   * finished with an error / still owned by the DMA. */
+  eth_tx_stats_t tx;
+  eth_tx_get_stats(&tx);
+  printf("--- tx: reflected %lu | sent %lu done %lu | busy %lu errors %lu | in flight %lu ---\r\n",
+         (unsigned long)tx_reflected,
+         (unsigned long)tx.sent, (unsigned long)tx.done, (unsigned long)tx.busy,
+         (unsigned long)tx.errors, (unsigned long)tx.in_flight);
 
   /* Filter cost per frame over the last period, then start a new period. */
   if (filter_cycles.count == 0u)
