@@ -4,8 +4,9 @@
 
 Bare-metal firmware that turns an STM32H723 into a simple SmartNIC: it receives
 Ethernet frames through the MAC's DMA, hands them from the interrupt to the main
-loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers and runs
-them through a first-match rule filter.
+loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers, runs
+them through a first-match rule filter, and sends the UDP frames that passed
+back to their sender from the same buffer (zero-copy RX → filter → TX).
 A BeagleBone Black on the other end of the cable acts as the traffic generator.
 
 ## Results at a glance
@@ -20,6 +21,13 @@ Measured on the board at 550 MHz, 100 Mbit/s line rate with 60-byte frames
 | + lean RX descriptor driver (replaces `HAL_ETH_ReadData()`) | 429 + 901 = 1 330 | 35 % | 0 |
 | + own ETH interrupt handler (one `DMACSR` read) | **357 + 902 = 1 259** | **33 %** | **0** |
 
+With the TX path (Phase 6), every passed UDP frame is also sent back:
+
+| Run, 1.5 M frames | ISR + main = cycles per frame | Reflected | Lost |
+|---|---|---|---|
+| RX only (reflect off), line rate | 357 + 930 = 1 287 | | 0 |
+| RX + filter + zero-copy reflect, ~53 k frames/s (BBB limit) | 357 + 1 305 = **1 662** | **1 500 000**, counted on the BBB | **0** |
+
 - **2.9x less CPU per frame** overall. The ISR went from 776 to 357 cycles
   at `-O2`. Filter cost per frame was cross-checked with a logic analyzer
   (GPIO pulse vs. DWT cycle counter).
@@ -28,13 +36,22 @@ Measured on the board at 550 MHz, 100 Mbit/s line rate with 60-byte frames
 - **Tried and measured, not kept:** NAPI-style polling RX was 6 % slower at
   line rate and lost 6.8 % under overload on this MCU (a Cortex-M7 interrupt
   is cheap). Kept as a build option, with the numbers.
-- **Bugs found by stress testing and fixed:** an RX deadlock after buffer
-  exhaustion ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)), and a
-  main loop that never left its RX loop under overload (Phase 5, step 3c).
+- **TX costs ~380 cycles per frame** (lean TX driver, main loop only, no TX
+  interrupt). No checksum is recomputed: swapping source and destination
+  does not change a one's-complement sum (proven in host tests). Reflect at
+  full line rate would need ~44 % of the CPU; the BBB (one core, sending and
+  receiving) could only drive ~53 k frames/s.
+- **Bugs found and fixed:** an RX deadlock after buffer exhaustion
+  ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)), a main loop that
+  never left its RX loop under overload (Phase 5, step 3c), RMII TX pins on
+  the wrong GPIOs so nothing reached the cable although the DMA reported
+  success ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)), and a 4-descriptor
+  TX ring that dropped bursts (Phase 6, step 3).
 - Filter: malformed / spoofed / TCP-scan / bad-checksum frames dropped and
   counted, floods rate-limited. Host unit tests + firmware build in CI.
 
-Details of every measurement are under [Performance](#performance).
+Details of every measurement are under [Performance](#performance) and
+[Phase 6: TX path](#phase-6-tx-path).
 
 ## Hardware
 
@@ -53,7 +70,7 @@ Details of every measurement are under [Performance](#performance).
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
 | 5     | Profiling, throughput limits, hardening       | Done (summary in [Results at a glance](#results-at-a-glance)): `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
-| 6     | TX path: forward the frames that passed the filter | In progress: lean TX driver (main loop only, no TX interrupt) sends a test frame every 5 s, received by the BBB; RMII TX pin bug found and fixed ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)); zero-copy reflect: passed UDP frames go back to the sender from the same buffer, checksums not recomputed (host-tested), verified on the BBB; under load: 1.5 M frames reflected with 0 loss (counted on the BBB), TX ~380 cycles per frame, TX ring 4 → 16 descriptors fixed the burst drops; next: README summary + PR |
+| 6     | TX path: forward the frames that passed the filter | Done: lean TX driver (main loop only, no TX interrupt) sends a test frame every 5 s, received by the BBB; RMII TX pin bug found and fixed ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)); zero-copy reflect: passed UDP frames go back to the sender from the same buffer, checksums not recomputed (host-tested), verified on the BBB; under load: 1.5 M frames reflected with 0 loss (counted on the BBB), TX ~380 cycles per frame, TX ring 4 → 16 descriptors fixed the burst drops |
 
 ## RX data path
 
