@@ -279,8 +279,10 @@ int main(void)
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
   printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
-  printf("RX mode: %s, %s driver\r\n", (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame",
-         (ETH_RX_LEAN != 0) ? "lean" : "HAL");
+  printf("RX mode: %s, %s driver, %s IRQ handler\r\n",
+         (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame",
+         (ETH_RX_LEAN != 0) ? "lean" : "HAL",
+         (ETH_RX_OWN_IRQ != 0) ? "own" : "HAL");
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 

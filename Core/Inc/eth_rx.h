@@ -49,6 +49,20 @@
 #define ETH_RX_LEAN         (1)
 #endif
 
+/** ETH interrupt handler (Phase 5, step 3b).
+ *  1 = our own handler (DEFAULT with the lean driver): reads the DMA status
+ *      register (DMACSR) ONCE and handles RX / RBU directly.
+ *  0 = HAL_ETH_IRQHandler(), which first reads MACISR, DMACSR, DMACIER and
+ *      EXTI PR3 on every interrupt. Build: make ... OWNIRQ=0
+ *  Interrupt mode only: NAPI switches RIE on and off, which our handler
+ *  does not check. */
+#ifndef ETH_RX_OWN_IRQ
+#define ETH_RX_OWN_IRQ      ((ETH_RX_LEAN != 0) && (ETH_RX_NAPI == 0))
+#endif
+#if ETH_RX_OWN_IRQ && ETH_RX_NAPI
+#error "ETH_RX_OWN_IRQ needs interrupt mode (ETH_RX_NAPI 0)"
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                */
 /* ------------------------------------------------------------------------- */
@@ -133,5 +147,11 @@ uint32_t eth_rx_poll(uint32_t budget);
 /** RX interrupts taken since boot. frames / irqs = how many frames one
  *  interrupt paid for (batching). */
 uint32_t eth_rx_irq_count(void);
+
+#if ETH_RX_OWN_IRQ
+/** The whole ETH interrupt, called from ETH_IRQHandler() instead of
+ *  HAL_ETH_IRQHandler(). */
+void eth_rx_irq_handler(void);
+#endif
 
 #endif /* INC_ETH_RX_H_ */

@@ -290,6 +290,62 @@ uint32_t eth_rx_irq_count(void)
     return rx_irq_total;
 }
 
+#if ETH_RX_OWN_IRQ
+/* Every DMACSR status bit that is cleared by writing 1 to it. */
+#define DMACSR_W1C  (ETH_DMACSR_NIS | ETH_DMACSR_AIS | ETH_DMACSR_CDE | ETH_DMACSR_FBE | \
+                     ETH_DMACSR_ERI | ETH_DMACSR_ETI | ETH_DMACSR_RWT | ETH_DMACSR_RPS | \
+                     ETH_DMACSR_RBU | ETH_DMACSR_RI  | ETH_DMACSR_TBU | ETH_DMACSR_TPS | \
+                     ETH_DMACSR_TI)
+
+/* Why our own handler: HAL_ETH_IRQHandler() reads 4 peripheral registers
+ * (MACISR, DMACSR, DMACIER, EXTI PR3) before it calls us, on EVERY interrupt.
+ * Each one is a slow bus read. In our setup only DMA events are enabled and
+ * the enable mask never changes (interrupt mode), so the DMA status alone
+ * says what happened: read DMACSR once. */
+void eth_rx_irq_handler(void)
+{
+    ETH_TypeDef *const eth = heth.Instance;
+    const uint32_t sr = eth->DMACSR;     /* the ONE status read */
+
+    if ((sr & (ETH_DMACSR_NIS | ETH_DMACSR_AIS)) == 0u)
+    {
+        /* Not a DMA event (MAC, wake-up: none is enabled today). Safety
+         * net: let the HAL find and clear the source, or it would fire
+         * again and again. */
+        HAL_ETH_IRQHandler(&heth);
+        return;
+    }
+
+    /* Clear exactly the bits we saw (write 1 to clear). A bit that the DMA
+     * sets after our read is not cleared, so it raises a new interrupt and
+     * nothing is lost. Clearing FIRST also means a frame that finishes while
+     * we harvest below gets its own interrupt. */
+    eth->DMACSR = sr & DMACSR_W1C;
+
+    if ((sr & ETH_DMACSR_FBE) != 0u)
+    {
+        /* Fatal bus error: the DMA stopped. Same as the HAL: switch the ETH
+         * interrupts off and mark the driver broken. */
+        __HAL_ETH_DMA_DISABLE_IT(&heth, ETH_DMACIER_NIE | ETH_DMACIER_AIE);
+        heth.ErrorCode   |= HAL_ETH_ERROR_DMA;
+        heth.DMAErrorCode = sr & (ETH_DMACSR_FBE | ETH_DMACSR_TPS | ETH_DMACSR_RPS);
+        heth.gState       = HAL_ETH_STATE_ERROR;
+        return;
+    }
+
+    if ((sr & ETH_DMACSR_RBU) != 0u)
+    {
+        rbu_total++;                     /* same counter as HAL_ETH_ErrorCallback() */
+    }
+
+    if ((sr & ETH_DMACSR_RI) != 0u)
+    {
+        rx_irq_total++;
+        (void)rx_harvest(UINT32_MAX);    /* every finished frame -> pkt_ring */
+    }
+}
+#endif /* ETH_RX_OWN_IRQ */
+
 uint32_t eth_rx_poll(uint32_t budget)
 {
 #if ETH_RX_NAPI

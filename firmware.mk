@@ -9,6 +9,7 @@
 #   make -f firmware.mk OPT=-O2 EXTRA=1000  # headroom test build in build/fw-O2-x1000/
 #   make -f firmware.mk OPT=-O2 NAPI=1      # NAPI-style polling RX in build/fw-O2-napi/
 #   make -f firmware.mk OPT=-O2 LEAN=0      # ST HAL RX path (no lean driver) in build/fw-O2-hal/
+#   make -f firmware.mk OPT=-O2 OWNIRQ=0    # lean driver + HAL_ETH_IRQHandler in build/fw-O2-halirq/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
@@ -40,6 +41,12 @@ LEAN     ?=
 ifeq ($(LEAN),0)
 BUILD    := $(BUILD)-hal
 endif
+# ETH interrupt handler (eth_rx.h ETH_RX_OWN_IRQ): empty = default (our own
+# handler with the lean driver), 0 = HAL_ETH_IRQHandler() in its own folder.
+OWNIRQ   ?=
+ifeq ($(OWNIRQ),0)
+BUILD    := $(BUILD)-halirq
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -62,6 +69,9 @@ DEFS += -DETH_RX_NAPI=$(NAPI)
 endif
 ifneq ($(LEAN),)
 DEFS += -DETH_RX_LEAN=$(LEAN)
+endif
+ifneq ($(OWNIRQ),)
+DEFS += -DETH_RX_OWN_IRQ=$(OWNIRQ)
 endif
 
 INCS := -ICore/Inc \
