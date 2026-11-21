@@ -86,6 +86,10 @@ bool eth_rx_start(void);
  */
 void eth_rx_buf_free(uint8_t *buf);
 
+/** true if buf is one of the RX pool buffers (TX uses it to know which
+ *  buffers go back to the pool once sent). */
+bool eth_rx_buf_is_pool(const uint8_t *buf);
+
 /**
  * @brief  Take the oldest received frame out of the packet ring.
  * @note   MAIN LOOP ONLY. When done with out->data, call eth_rx_buf_free().

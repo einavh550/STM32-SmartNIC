@@ -53,6 +53,7 @@ Details of every measurement are under [Performance](#performance).
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
 | 5     | Profiling, throughput limits, hardening       | Done (summary in [Results at a glance](#results-at-a-glance)): `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
+| 6     | TX path: forward the frames that passed the filter | In progress: lean TX driver (main loop only, no TX interrupt) sends a test frame every 5 s, received by the BBB; RMII TX pin bug found and fixed ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)); next: zero-copy reflect of passed frames |
 
 ## RX data path
 
@@ -987,6 +988,48 @@ cycles, 1.5 M frames, log OFF):
   18 262), so the DMA stopped for lack of a buffer 3x less often (`rbu`
   300 674 → 90 495).
 
+## Phase 6: TX path
+
+### Step 1: lean TX driver and a test frame
+
+**Design (`eth_tx.[ch]`):**
+- Main loop only: `eth_tx_send()` fills a TX descriptor (buffer address,
+  length, `__DMB()`, then OWN | first | last | CRC + pad insertion) and moves
+  the tail pointer `DMACTDTPR`, which also wakes a suspended TX DMA.
+  `eth_tx_reclaim()` runs every main-loop pass, reads `DESC3` once per
+  descriptor and collects the ones the DMA has finished (OWN cleared, `ES`
+  = error). One context, so no locks and no TX interrupt (no IOC bit).
+  Linux NIC drivers clean their TX ring the same way, from the poll loop.
+- Zero-copy ready: a sent buffer that belongs to the RX pool goes back to
+  the pool on reclaim (`eth_rx_buf_is_pool()`), for step 2.
+- Ring full: `eth_tx_send()` returns false at once and counts `busy`. It
+  never waits, so TX can never hold up RX.
+- The HAL still initialises the TX ring and starts the TX DMA
+  (`HAL_ETH_Start_IT()`); its TX functions are never called.
+- Test frame every stats period (5 s): UDP broadcast 192.168.10.1:5000 →
+  192.168.10.255:5001, payload `STM32-SmartNIC TX test #N`, IPv4 header
+  checksum in software, UDP checksum 0. Its buffer sits in D2 SRAM next to
+  the RX pool (DMA-reachable, non-cacheable), not in cached D1 SRAM.
+- New stats line: `--- tx: sent N done N | busy 0 errors 0 | in flight 0 ---`.
+
+**Test:** a UDP socket on the BBB (`tcpdump` is not installed there):
+
+```
+python3 -c 'import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("", 5001))
+while True: print(*s.recvfrom(2048))'
+```
+
+- First run (`putty_tx1.log`): board `sent 37 done 37 errors 0`, BBB
+  nothing, and its `ip -s link` showed **RX packets 0** since boot. Cause:
+  two RMII TX pins on the wrong GPIOs. Full story in
+  [docs/bug-tx-pins.md](docs/bug-tx-pins.md).
+- After the pin fix (`putty_tx1b.log`): the BBB printed
+  `b'STM32-SmartNIC TX test #3' ('192.168.10.1', 5000)` through `#13`, one
+  every 5 s, none missing; BBB `RX packets` 0 → 21; board `sent 19 done 19
+  busy 0 errors 0`. Linux only hands a frame to the socket if the Ethernet,
+  IPv4 and UDP headers are valid, so this also checks the frame format.
+
 ## BBB test link
 
 The BBB is controlled over USB SSH (`ssh debian@192.168.7.2`) while its
@@ -1105,6 +1148,7 @@ Core/Inc, Core/Src
   ring_buffer.[ch]       SPSC ring buffer
   ring_buffer_test.[ch]  on-target self-test
   eth_rx.[ch]            RX buffer pool, lean RX descriptor driver + own ETH IRQ handler (HAL paths kept), rings glue, MAC checksum report
+  eth_tx.[ch]            lean TX descriptor driver (main loop only), test frame
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
   perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max, ETH ISR total
   uart_log.[ch]          non-blocking printf: RAM ring + USART3 TX interrupt
@@ -1117,6 +1161,7 @@ tools/bbb/stress.sh      pktgen rate ramp (stress test), run on the BBB
 tools/la/pulse_width.py  logic analyzer capture of PERF_PIN, pulse widths
 tests/                   host unit tests (parser, filter), 2-thread ring buffer test (TSan) + Makefile
 docs/bug-rx-deadlock.md  bug write-up: RX deadlock after buffer exhaustion
+docs/bug-tx-pins.md      bug write-up: TX "sent" but nothing on the wire (RMII pins)
 .github/workflows/ci.yml CI: host tests + firmware build on every push
 firmware.mk              command-line firmware build (same flags as CubeIDE)
 STM32H723ZGTX_FLASH.ld   linker script with D2 SRAM sections for the ETH DMA

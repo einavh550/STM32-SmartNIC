@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "ring_buffer_test.h"
 #include "eth_rx.h"
+#include "eth_tx.h"
 #include "pkt_parse.h"
 #include "pkt_filter.h"
 #include "filter_policy.h"
@@ -269,6 +270,9 @@ int main(void)
     Error_Handler();
   }
   printf("ETH RX started\r\n");
+  eth_tx_init();         /* TX ring: ours from now on (main loop only) */
+  printf("ETH TX ready: test frame every %u s (UDP broadcast to port 5001)\r\n",
+         (unsigned)(STATS_PERIOD_MS / 1000u));
   /* Read back from the RCC registers: proves the PLL really runs (550 MHz). */
   printf("CPU clock: %lu MHz\r\n", (unsigned long)(HAL_RCC_GetSysClockFreq() / 1000000u));
   perf_init();
@@ -370,12 +374,19 @@ int main(void)
 
     handle_button();
     eth_rx_poll_hw();   /* collect the MAC's clear-on-read drop counters */
+    (void)eth_tx_reclaim();   /* collect TX descriptors the DMA has finished */
 
     /* Unsigned subtraction stays correct when HAL_GetTick() wraps at 2^32. */
     if ((HAL_GetTick() - last_stats_ms) >= STATS_PERIOD_MS)
     {
       last_stats_ms = HAL_GetTick();
       print_stats();
+      /* Phase 6 step 1: one test frame per stats period proves TX works. */
+      static uint32_t tx_test_seq;
+      if (eth_tx_send_test(tx_test_seq))
+      {
+        tx_test_seq++;
+      }
     }
   }
   /* USER CODE END 3 */
@@ -660,6 +671,14 @@ static void print_stats(void)
          (unsigned)ETH_RX_BUF_COUNT, (unsigned long)eth_rx_take_period_low(),
          (unsigned long)hw.free_low, (unsigned long)hw.pool_empty,
          (unsigned long)uart_log_dropped());
+
+  /* TX (Phase 6): handed to the DMA / finished / refused (ring full) /
+   * finished with an error / still owned by the DMA. */
+  eth_tx_stats_t tx;
+  eth_tx_get_stats(&tx);
+  printf("--- tx: sent %lu done %lu | busy %lu errors %lu | in flight %lu ---\r\n",
+         (unsigned long)tx.sent, (unsigned long)tx.done, (unsigned long)tx.busy,
+         (unsigned long)tx.errors, (unsigned long)tx.in_flight);
 
   /* Filter cost per frame over the last period, then start a new period. */
   if (filter_cycles.count == 0u)
