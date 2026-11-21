@@ -1157,9 +1157,9 @@ LinkLayerAddress=00:80:e1:00:00:00
 
 - DHCP stays on so the same cable can go to a router for `apt install`;
   on the board link only the static address is used.
-- The board has no TX path yet, so it never answers ARP. The static
-  neighbor entry gives the BBB the board's MAC up front; Scapy scenarios
-  send at layer 2 (`sendp`) and set the MAC themselves.
+- The board does not answer ARP (its TX path only reflects UDP, Phase 6).
+  The static neighbor entry gives the BBB the board's MAC up front; Scapy
+  scenarios send at layer 2 (`sendp`) and set the MAC themselves.
 
 Scenarios live in `tools/bbb/nic_test.py` (Scapy 2.5, `apt install
 python3-scapy`). Copy it over USB and run it on the BBB:
