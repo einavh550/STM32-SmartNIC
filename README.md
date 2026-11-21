@@ -53,7 +53,7 @@ Details of every measurement are under [Performance](#performance).
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
 | 5     | Profiling, throughput limits, hardening       | Done (summary in [Results at a glance](#results-at-a-glance)): `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
-| 6     | TX path: forward the frames that passed the filter | In progress: lean TX driver (main loop only, no TX interrupt) sends a test frame every 5 s, received by the BBB; RMII TX pin bug found and fixed ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)); zero-copy reflect: passed UDP frames go back to the sender from the same buffer, checksums not recomputed (host-tested), verified on the BBB; next: line-rate measurement |
+| 6     | TX path: forward the frames that passed the filter | In progress: lean TX driver (main loop only, no TX interrupt) sends a test frame every 5 s, received by the BBB; RMII TX pin bug found and fixed ([docs/bug-tx-pins.md](docs/bug-tx-pins.md)); zero-copy reflect: passed UDP frames go back to the sender from the same buffer, checksums not recomputed (host-tested), verified on the BBB; under load: 1.5 M frames reflected with 0 loss (counted on the BBB), TX ~380 cycles per frame, TX ring 4 → 16 descriptors fixed the burst drops; next: README summary + PR |
 
 ## RX data path
 
@@ -1073,6 +1073,52 @@ port `nic_test.py` uses):
 - No buffer leak: `free bufs 12/16` after the test, as before it. TX `sent
   26 done 26` (6 reflected + 20 test frames), `busy 0 errors 0`.
 
+### Step 3: reflect under load (1.5 M frames)
+
+pktgen sends 1.5 M frames to port 5000 (`stress.sh 0`); every one passes
+and is reflected to the BBB's port 40000. Counted on both ends: the board's
+`reflected` / `busy`, and on the BBB `RX packets` (`ip -s link`) and `Udp
+NoPorts` (reflected datagrams that reached the UDP layer and found no
+socket on port 40000: each one is a complete, valid frame).
+
+| Run (log) | TX descriptors | pktgen rate | Reflected | `busy` | BBB got back | Cost/frame (ISR + main) |
+|---|---|---|---|---|---|---|
+| A (`putty_tx3.log`) | 4 | ~33 k/s | 1 499 853 | 147 | `NoPorts` +1 499 853 | 355 + 1 309 = 1 664 |
+| B (`putty_tx3_noreflect.log`), reflect OFF | 4 | ~146 k/s (line rate) | 0 | 0 | | 357 + 930 = **1 287** |
+| C (`putty_tx4.log`) | **16** | ~33 k/s | **1 500 000** | **0** | `NoPorts` **+1 500 000** | 357 + 1 320 = 1 677 |
+| D (`putty_tx5.log`), BBB drops early | 16 | ~53 k/s | **1 500 000** | **0** | `RX packets` +1 500 045 | 357 + 1 305 = 1 662 |
+
+All runs: 0 FIFO overflow, 0 TX errors, pool back to `12/16` at the end.
+
+- **Zero loss end to end:** 1.5 M in, 1.5 M reflected, 1.5 M counted by the
+  BBB's UDP layer (run C). The BBB answered some datagrams with ICMP port
+  unreachable (rate-limited, 51 in 45 s): they passed the `ping` rule and
+  were not reflected (ICMP), as designed.
+- **TX costs ~380 cycles per frame** (1 664 - 1 287, ~0.7 us): the reflect
+  swaps, 4 descriptor words written to D2, two `__DMB()`, the tail-pointer
+  register write, and the reclaim read. The ISR is unchanged (357), so it
+  is all main-loop work. The cost does not depend on the rate (1 662-1 677
+  at 33 k and 53 k frames/s).
+- **Bug found: 4 TX descriptors were too few.** After each stats print the
+  main loop finds a backlog (up to 12 frames, the pool minus the 4 buffers
+  parked in RX descriptors) and sends it faster (~2.4 us per frame) than
+  the wire carries it (6.7 us per 60-byte frame). A TX descriptor stays
+  busy until the wire has sent its frame, so the TX ring IS the TX queue;
+  RX descriptors are re-armed by the ISR at once, which is why 4 are enough
+  there. Fix: `ETH_TX_DESC_CNT` 4 → 16 (`stm32h7xx_hal_conf.h`, 384 B of
+  D2), with a `_Static_assert` in `eth_tx.c` so a CubeMX regeneration
+  cannot silently restore 4. Result: `busy` 147 → 0, same cost.
+- The backlog now waits in the TX ring instead of being dropped, so its
+  buffers are out of the pool longer: pool found empty 26 → 256 times, RX
+  DMA stopped (`rbu`) 25 → 34 times, all covered by the MAC RX FIFO (0
+  overflow).
+- **Not line rate, and the limit is the BBB:** its single CPU core sends
+  with pktgen and receives every reflected frame. Dropping the reflected
+  frames early (`iptables -t raw -A PREROUTING -p udp --dport 40000 -j
+  DROP`) raised the rate from ~33 k to ~53 k frames/s; the board was 15 %
+  busy. From the measured cost, reflect at full line rate (~145 700
+  frames/s, a frame every ~3 775 cycles) would need ~44 % of the CPU.
+
 ## BBB test link
 
 The BBB is controlled over USB SSH (`ssh debian@192.168.7.2`) while its
@@ -1230,6 +1276,11 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - Only 4 RX DMA descriptors (CubeMX default; `ETH_RX_DESC_CNT` sits in a
   CubeMX-generated part of `stm32h7xx_hal_conf.h`). Enough in interrupt
   mode, too few for NAPI-style polling (the DMA stops while main is busy).
+  TX has 16 (one per pool buffer, Phase 6 step 3).
+- Reflect was measured up to ~53 k frames/s only: the BBB (one CPU core)
+  cannot send at line rate and receive the reflected frames at the same
+  time. Line rate in both directions would need a second traffic source or
+  a faster receiver.
 - The lean RX driver assumes one buffer per frame (1536-byte buffers) and
   no timestamps. A descriptor that breaks this is passed on with length 0
   and counted as malformed instead of being reassembled.

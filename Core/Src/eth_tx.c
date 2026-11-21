@@ -11,6 +11,15 @@
 
 extern ETH_HandleTypeDef heth;           /* main.c (CubeMX) */
 
+/* TX ring size (stm32h7xx_hal_conf.h, CubeMX ETH "Tx Descriptor Length").
+ * With 4 descriptors a backlog of frames (after a stats print, up to the
+ * whole pool) did not fit: the reflect test lost 147 of 1.5 M frames as
+ * "busy" (Phase 6 step 3). With one descriptor per pool buffer a frame can
+ * always be queued. The check stops a CubeMX regeneration from silently
+ * putting the default 4 back. */
+_Static_assert(ETH_TX_DESC_CNT >= ETH_RX_BUF_COUNT,
+               "set the ETH Tx Descriptor Length to 16 in CubeMX (stm32h7xx_hal_conf.h)");
+
 /* Ring state (main loop only, so plain variables):
  *   tx_head = next descriptor to fill,
  *   tx_tail = oldest descriptor not yet reclaimed,
