@@ -40,10 +40,18 @@
 /* USER CODE BEGIN PD */
 #define STATS_PERIOD_MS   (5000u)   /* how often the filter counters are printed */
 #define BUTTON_DEBOUNCE_MS (200u)   /* ignore button bounces closer than this */
+/* Most frames one main-loop pass handles before it does its other work
+ * (refill, button, stats) and starts a new pass. Without a limit, sustained
+ * overload kept main in the RX loop for a whole 10 s burst: the stats print
+ * waited, and that pass's 32-bit cycle delta wrapped (Phase 5, step 3b).
+ * 16 = the whole pool: at most one full pkt_ring per pass. */
+#define MAIN_RX_BUDGET    (ETH_RX_BUF_COUNT)
 /* CPU headroom test: fake work added to every frame, in CPU cycles.
  * 0 = normal firmware. Raise it step by step at line rate until frames
  * are lost: the last value with zero loss = cycles still free per frame. */
+#ifndef EXTRA_CYCLES               /* or from the build: -DEXTRA_CYCLES=1000u */
 #define EXTRA_CYCLES       (0u)
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -105,6 +113,7 @@ static perf_stats_t path_limit[POLICY_RULE_COUNT];
  * ISR time that interrupted it taken out, so nothing is counted twice. */
 static uint64_t main_rx_cycles;    /* main-loop RX work, ISR time removed */
 static uint32_t main_rx_frames;    /* frames handled in this period */
+static uint32_t irq_mark;          /* eth_rx_irq_count() at period start */
 static uint32_t isr_cycles_mark;   /* perf_eth_isr_cycles at period start */
 static uint32_t period_start_ms;   /* HAL_GetTick() at period start */
 /* USER CODE END PV */
@@ -226,8 +235,9 @@ int main(void)
   /* Start Ethernet RX. Done here (not in USER CODE 2) so the COM port is
    * already up and printf works. Order matters:
    * 1. eth_rx_init() fills the free list,
-   * 2. HAL_ETH_Start_IT() takes 4 buffers for the descriptors (via
-   *    HAL_ETH_RxAllocateCallback) and enables the ETH DMA interrupts. */
+   * 2. eth_rx_start() -> HAL_ETH_Start_IT() takes 4 buffers for the
+   *    descriptors (via HAL_ETH_RxAllocateCallback) and enables the ETH DMA
+   *    interrupts; the lean driver then takes the descriptor ring over. */
   if (!pkt_filter_init(&filter, filter_policy, POLICY_RULE_COUNT, POLICY_DEFAULT_ACTION))
   {
     printf("Invalid filter policy\r\n");
@@ -253,7 +263,7 @@ int main(void)
   }
 
   eth_rx_init();
-  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+  if (!eth_rx_start())   /* HAL_ETH_Start_IT() + lean driver takeover */
   {
     printf("ETH start failed\r\n");
     Error_Handler();
@@ -275,6 +285,10 @@ int main(void)
   printf("DWT cycle counter on, measurement overhead %lu cycles\r\n",
          (unsigned long)perf_overhead());
   printf("Headroom test: +%lu extra cycles per frame\r\n", (unsigned long)EXTRA_CYCLES);
+  printf("RX mode: %s, %s driver, %s IRQ handler\r\n",
+         (ETH_RX_NAPI != 0) ? "NAPI polling" : "interrupt per frame",
+         (ETH_RX_LEAN != 0) ? "lean" : "HAL",
+         (ETH_RX_OWN_IRQ != 0) ? "own" : "HAL");
   printf("Per-frame log ON (USER button toggles)\r\n");
   BSP_LED_On(LED_YELLOW);
 
@@ -293,8 +307,16 @@ int main(void)
     time_snapshot(&work_t0, &work_isr);
     uint32_t frames_now = 0u;   /* frames handled in this loop pass */
 
-    /* Consumer side: take every frame the ISR queued, then give the buffer back. */
-    while (eth_rx_pop(&pkt))
+    /* NAPI mode: main reads the finished frames from the DMA itself (up to
+     * a budget) into the packet ring. Inside the timed window, so the HAL
+     * time that moved out of the ISR is still counted. */
+    (void)eth_rx_poll(ETH_RX_POLL_BUDGET);
+
+    /* Consumer side: take the queued frames (at most MAIN_RX_BUDGET, so the
+     * rest of the loop still runs under overload), then give each buffer
+     * back. Budget checked FIRST, so no frame is popped and then skipped;
+     * frames left over stay in pkt_ring for the next pass. */
+    while ((frames_now < MAIN_RX_BUDGET) && eth_rx_pop(&pkt))
     {
       frames_now++;
       /* Parse, drop if malformed or the MAC reported a checksum error, else
@@ -671,7 +693,12 @@ static void print_stats(void)
            (unsigned long)main_rx_frames, (unsigned long)isr_pf,
            (unsigned long)main_pf, (unsigned long)(isr_pf + main_pf),
            (unsigned long)busy_pct);
+    /* Batching: how many frames one RX interrupt paid for this period. */
+    uint32_t irqs = eth_rx_irq_count() - irq_mark;
+    printf("--- rx irqs %lu | frames per irq %lu ---\r\n", (unsigned long)irqs,
+           (unsigned long)((irqs != 0u) ? (main_rx_frames / irqs) : 0u));
   }
+  irq_mark = eth_rx_irq_count();
   main_rx_cycles  = 0u;
   main_rx_frames  = 0u;
   isr_cycles_mark = isr_now;

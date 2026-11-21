@@ -56,13 +56,20 @@ jobs:
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
           arm-none-eabi-gcc --version
 
-      - name: Build the firmware
+      - name: Build the firmware (-O0, like CubeIDE Debug)
         run: make -f firmware.mk -j"$(nproc)"
 
-      - name: Keep the .elf and .map as a download
+      # The optimised build must stay warning-free too: -O2 runs more
+      # analysis and can warn where -O0 is silent (e.g. maybe-uninitialized).
+      - name: Build the firmware (-O2)
+        run: make -f firmware.mk -j"$(nproc)" OPT=-O2
+
+      - name: Keep the .elf and .map files as a download
         uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: |
             build/fw/STM32-SmartNIC.elf
             build/fw/STM32-SmartNIC.map
+            build/fw-O2/STM32-SmartNIC.elf
+            build/fw-O2/STM32-SmartNIC.map

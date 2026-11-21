@@ -8,6 +8,34 @@ loop without copying, parses the Ethernet / IPv4 / TCP / UDP headers and runs
 them through a first-match rule filter.
 A BeagleBone Black on the other end of the cable acts as the traffic generator.
 
+## Results at a glance
+
+Measured on the board at 550 MHz, 100 Mbit/s line rate with 60-byte frames
+(~145 700 frames/s, one frame every ~3 775 CPU cycles), per-frame log off:
+
+| Build / change | ISR + main = cycles per frame | CPU busy | Lost at line rate |
+|---|---|---|---|
+| `-O0`, ST HAL RX path | 3 656 | ~96 % | 0 |
+| `-O2` | 1 660 | ~43 % | 0 |
+| + lean RX descriptor driver (replaces `HAL_ETH_ReadData()`) | 429 + 901 = 1 330 | 35 % | 0 |
+| + own ETH interrupt handler (one `DMACSR` read) | **357 + 902 = 1 259** | **33 %** | **0** |
+
+- **2.9x less CPU per frame** overall. The ISR went from 776 to 357 cycles
+  at `-O2`. Filter cost per frame was cross-checked with a logic analyzer
+  (GPIO pulse vs. DWT cycle counter).
+- **~2 500 spare cycles per frame**: 1.5 M frames with +2 500 fake cycles
+  per frame are still received with 0 loss. The HAL RX path lost 2.3 % there.
+- **Tried and measured, not kept:** NAPI-style polling RX was 6 % slower at
+  line rate and lost 6.8 % under overload on this MCU (a Cortex-M7 interrupt
+  is cheap). Kept as a build option, with the numbers.
+- **Bugs found by stress testing and fixed:** an RX deadlock after buffer
+  exhaustion ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)), and a
+  main loop that never left its RX loop under overload (Phase 5, step 3c).
+- Filter: malformed / spoofed / TCP-scan / bad-checksum frames dropped and
+  counted, floods rate-limited. Host unit tests + firmware build in CI.
+
+Details of every measurement are under [Performance](#performance).
+
 ## Hardware
 
 | Part             | Role                                                      |
@@ -24,7 +52,7 @@ A BeagleBone Black on the other end of the cable acts as the traffic generator.
 | 2     | Interrupt-driven, zero-copy Ethernet RX       | Done, verified on hardware |
 | 3     | Header parsing and filter pipeline: sanity, anti-spoofing, TCP scan detection, rate limiting, rule policy | Done: verified on hardware, host unit tests in CI |
 | 4     | Traffic generation and stress tests from the BBB | Done: link up, Scapy generator, normal / spoof / scan / flood / malformed / bad-checksum scenarios verified, core at 550 MHz (PLL), per-frame log switch (USER button), DWT cycles per frame and per path, cross-checked with a GPIO pulse + logic analyzer, stress tested at 100 Mbit/s line rate with zero loss (after two fixes), whole cost per frame measured (ISR + main loop: ~3 650 of 3 700 cycles, ~250-500 cycles headroom), RX deadlock bug written up ([docs/bug-rx-deadlock.md](docs/bug-rx-deadlock.md)) |
-| 5     | Profiling, throughput limits, hardening       | Planned: `-O2` build, polling RX (fewer interrupts), measured with the whole-cost line |
+| 5     | Profiling, throughput limits, hardening       | Done (summary in [Results at a glance](#results-at-a-glance)): `-O2` build done (whole cost 3 656 → 1 660 cycles per frame, CPU ~96 % → ~43 % busy at line rate, built in CI too); headroom at `-O2` ~2 000 spare cycles per frame (was ~250-500); NAPI-style polling RX measured and rejected (slower on this MCU, kept as a build option); lean RX driver instead of `HAL_ETH_ReadData()`: ISR 776 → 429 cycles, whole cost 1 683 → 1 330 cycles per frame (CPU 35 % busy at line rate), 0 loss at +2 500 extra cycles where the HAL lost 2.3 %; own ETH interrupt handler (reads `DMACSR` once): ISR 429 → 357, whole cost 1 259 cycles per frame (CPU 33 % busy); frame budget per main-loop pass (stats keep running under overload) |
 
 ## RX data path
 
@@ -696,8 +724,268 @@ main loop taken out, and prints every 5 s:
 today. That is why real NICs do this work in hardware (or many cores) and
 keep the per-packet software path to a few hundred cycles.
 
-**Still to measure:** an optimised (`-O2`) build, which should shrink both
-the HAL driver part and the filter part.
+### Phase 5, step 1: optimised build (`-O2`)
+
+Same firmware and same stress test (`sudo MAX_COUNT=1500000 sh stress.sh 0`,
+60-byte UDP frames at ~145 000 frames/s), built with `-O2` instead of `-O0`
+(`make -f firmware.mk OPT=-O2`). Log: `putty_o2.log`.
+
+| | `-O0` (Debug) | `-O2` | Speed-up |
+|---|---|---|---|
+| Frames sent / seen by the MAC / seen by the filter | 1.5 M / 1.5 M / 1.5 M | 1.5 M / 1.5 M / 1.5 M | 0 lost in both |
+| Filter, cycles per frame (avg) | 1 858 (3.37 µs) | **630 (1.15 µs)** | 2.9x |
+| ETH ISR, cycles per frame | 1 222 | **769** | 1.6x |
+| Main loop RX work, cycles per frame | 2 434 | **891** | 2.7x |
+| **Whole cost per frame** | 3 656 | **1 660** | **2.2x** |
+| CPU busy on RX at line rate | ~96 % | **~43 %** | more than half the CPU now free |
+
+- The filter (our own code) gains the most: at `-O0` every variable lives
+  in memory; at `-O2` it stays in registers and small functions are inlined.
+- The ISR gains the least, so it is now the **largest single part** of the
+  cost (769 of 1 660 cycles). Most of it is the ST HAL driver (descriptor
+  walk, callbacks), so the next step is fewer interrupts per frame
+  (NAPI-style polling: mask the RX interrupt while the main loop drains).
+- The buffer pool still runs empty for moments (`rbu` +4, failed
+  allocations +12 in 1.5 M frames) and no frame is lost. Even with half the
+  CPU free the pool empties, so the stats print stall (not the per-frame
+  cost) is what drains it.
+- The first try of this run was invalid: the per-frame log was still on
+  after flashing (it starts on). Every frame then tried to `printf`
+  (41 M log writes dropped, ~10 000 cycles per frame in the main loop) and
+  ~65 % of frames were lost in the MAC FIFO. Turn the log off with the USER
+  button before any throughput test.
+
+### Phase 5, step 1b: CPU headroom at `-O2`
+
+Edge test 2 again, now on the `-O2` build: fake work per frame
+(`EXTRA_CYCLES`) is raised until frames are lost. Each value is its own
+build, set from the command line, so `main.c` is never edited for a test:
+
+```
+make -f firmware.mk OPT=-O2 EXTRA=2000   # -> build/fw-O2-x2000/STM32-SmartNIC.elf
+```
+
+Same stress (`sudo MAX_COUNT=1500000 sh stress.sh 0`, ~145 700 frames/s),
+log OFF, one PuTTY log per value (`putty_headroom_o2_x<N>.log`). At line
+rate a frame arrives every **~3 775 cycles** (550 MHz / 145 700).
+
+| `EXTRA_CYCLES` | Whole cost per frame | CPU busy | Pool found empty | Lost |
+|---|---|---|---|---|
+| 0    | 1 660 | 43 % | 12 | **0** |
+| 1000 | 2 676 | 70 % | 26 | **0** (2 runs, identical) |
+| 1500 | 3 167 | 83 % | 33 | **0** |
+| 2000 | 3 675 | 97 % | 16 576 | **0** |
+| 2500 | 3 868 | 99 % | 413 641 | 33 879 (2.3 %) |
+
+- **~2 000 cycles per frame are free at `-O2`**, against ~250-500 at `-O0`:
+  4-8x more room for real per-packet work (more rules, a TX path).
+- At +2000 the board survives on the edge: the pool is empty 16 576 times
+  and the MAC RX FIFO holds frames until a buffer is freed.
+- Over the limit it degrades gracefully, it does not die: ~142 000
+  frames/s still pass at 99 % busy, the MAC FIFO drops only the rest, and
+  every RX stall is recovered (`rbu` 82 728 = refills 82 728).
+- **Under overload the ISR got cheaper: 771 → 548 cycles per frame.** The
+  main loop is always behind, so each interrupt finds several frames and
+  pays its entry/exit cost once for all of them. Polling RX (next step)
+  does this batching on purpose, not only under overload.
+- Pitfall: CubeIDE's Debug button rebuilds and flashes its own `-O0`
+  `Debug/` build, not these files. Flash them with
+  `STM32_Programmer_CLI ... -w build/fw-O2-x<N>/STM32-SmartNIC.elf`, and
+  check the boot line `Headroom test: +N` before trusting a run.
+
+### Phase 5, step 2: NAPI-style polling RX (measured, not kept)
+
+**Idea (from Linux NAPI):** the first RX interrupt switches itself off (RIE
+in the DMA interrupt-enable register) and only wakes the main loop. Main
+reads the finished frames itself (`eth_rx_poll()`, up to 8 per pass) and
+switches the interrupt back on only when the DMA has nothing left. Under
+load, one interrupt should then pay for many frames. Re-enabling has a race
+(a frame finishing just before RI is cleared would never be announced), so
+`eth_rx_poll()` clears RI, looks once more, and only then enables RIE.
+
+Build switch: `ETH_RX_NAPI` in `eth_rx.h` (default 0 = interrupt mode),
+`make -f firmware.mk OPT=-O2 NAPI=1` → `build/fw-O2-napi/`. The stats show
+`rx irqs N | frames per irq M` and the boot line says `RX mode: ...`.
+
+All runs `-O2`, log OFF, ~145 700 frames/s (a frame every ~3 775 cycles):
+
+| Run (log) | Mode | Frames per IRQ | ISR + main = cycles/frame | CPU busy | Lost |
+|---|---|---|---|---|---|
+| Line rate, 2 064 000 frames (`putty_napi_irq.log`) | interrupt | 1 | 776 + 907 = **1 683** | 44 % | 0 |
+| Line rate, 2 064 000 frames (`putty_napi.log`) | NAPI | 1 | 142 + 1 641 = **1 783** | 47 % | 0 |
+| Overload +2 500, 1.5 M frames (`putty_headroom_o2_x2500.log`) | interrupt | ~1 | 548 + 3 320 = **3 868** | 99 % | 33 879 (2.3 %) |
+| Overload +2 500, 1.5 M frames (`putty_napi_x2500.log`) | NAPI | **16 831** | 130 + 3 910 = **4 040** | 99 % | 102 052 (**6.8 %**) |
+
+- **At line rate NAPI cannot batch.** A frame costs ~1 700 cycles but
+  arrives only every ~3 775, so main is always done before the next one:
+  still one interrupt per frame, plus the cost of switching RIE off and on.
+  Result: 6 % slower.
+- **Under overload the batching works** (30 interrupts for 505 000 frames,
+  ISR 548 → 130 cycles per frame), **but the total got worse.** The work of
+  `HAL_ETH_ReadData()` did not disappear, it moved into the main loop.
+- **Why worse: the DMA starves.** There are only 4 RX descriptors. In
+  interrupt mode the ISR preempts main and re-arms a descriptor right away.
+  With NAPI they are re-armed only when main polls, and 8 frames of work
+  (~31 000 cycles here) use up 4 descriptors long before that:
+  `rbu` 1 397 803, i.e. the DMA stopped for almost every frame and frames
+  waited in the small MAC FIFO until it overflowed.
+- **The loss is just arithmetic:** lost ≈ 1 − 3 775 / cost per frame.
+  Interrupt mode: 1 − 3 775 / 3 868 = 2.4 % (measured 2.3 %). NAPI:
+  1 − 3 775 / 4 040 = 6.6 % (measured 6.8 %). Every cycle per frame counts.
+- **Lesson:** NAPI pays off in Linux, where an interrupt is expensive
+  (context switch, cache damage). On a Cortex-M7 the interrupt entry is a
+  few dozen cycles; the real cost is the HAL driver code, and NAPI only moves
+  it. Measured before keeping it, so interrupt mode stays the default.
+- **What would help instead:** a leaner RX path than the HAL's
+  `HAL_ETH_ReadData()` (step 3). More RX descriptors were considered and
+  dropped: in interrupt mode the ISR re-arms a descriptor at once, a
+  descriptor only holds one of the same 16 pool buffers (no extra room for
+  waiting frames), and sustained overload loss is set by the cost per frame,
+  not by queue depth.
+
+### Phase 5, step 3: lean RX driver
+
+**Why:** at `-O2` the ETH ISR was the largest single cost (776 of 1 683
+cycles per frame) and most of it was `HAL_ETH_ReadData()`. The HAL handles
+every case (frames split over several descriptors, timestamps, polling
+mode, a callback per step) and reads the same descriptor word ~6 times per
+frame; our checksum code then searched the 4 descriptors for the buffer.
+Every one of those reads goes to D2 SRAM, which is non-cacheable (MPU
+region 1), so each is a slow bus access. Our case is simpler: one 1536-byte
+buffer always holds a whole frame, and timestamps are off.
+
+**What (`eth_rx.c`, `ETH_RX_LEAN`, default 1):**
+- `rx_harvest()`: per frame read `DESC3` once (OWN, first + last, length)
+  and `DESC1` once (the checksum report), push buffer + length + flags into
+  `pkt_ring`, move to the next descriptor.
+- `rx_arm()`: give each empty descriptor a pool buffer (`DESC0`), `__DMB()`,
+  then `DESC3` = OWN | BUF1V | IOC (the DMA must see the address before the
+  OWN bit), and move the tail pointer once, which also wakes a DMA stopped
+  by RBU.
+- `rx_desc_buf[]`: which buffer each descriptor holds, in normal cached RAM
+  instead of `BackupAddr0` in D2.
+- `eth_rx_start()`: the HAL still starts the MAC and DMA
+  (`HAL_ETH_Start_IT()`, ETH IRQ masked meanwhile), then the driver copies
+  the HAL's ring state and the HAL never touches RX again. The ISR, NAPI
+  poll and the RBU refill all use `rx_harvest()`.
+- `make -f firmware.mk OPT=-O2 LEAN=0` builds the HAL path
+  (`build/fw-O2-hal/`) for comparison; the boot line says which driver runs.
+
+**Correctness** (`putty_lean.log`, per-frame log on): `malformed --count 1`
+gives malformed +9, bad-checksum +2, passed +1, the same as with the HAL, so
+the checksum report is still read correctly.
+
+**Speed**, `-O2`, log OFF, ~145 700 frames/s (a frame every ~3 775 cycles):
+
+| Run (log) | Driver | ISR + main = cycles/frame | CPU busy | Lost |
+|---|---|---|---|---|
+| Line rate, 2 064 000 frames (`putty_napi_irq.log`) | HAL | 776 + 907 = **1 683** | 44 % | 0 |
+| Line rate, 1 500 000 frames (`putty_lean_speed.log`) | lean | 429 + 901 = **1 330** | 35 % | 0 |
+| +2 500 extra, 1.5 M frames (`putty_headroom_o2_x2500.log`) | HAL | 548 + 3 320 = 3 868 | 99 % | 33 879 (2.3 %) |
+| +2 500 extra, 1.5 M frames (`putty_lean_x2500.log`) | lean | 425-520 + 3 251-3 346 = **3 771** | | **0** |
+
+- **The ISR got 45 % cheaper (776 → 429 cycles), the whole frame 21 %.**
+  The main loop (901 vs 907) and the filter (~634) did not change, so the
+  saving is the driver alone.
+- **Overload: from 2.3 % lost to 0.** The total cost at +2 500 (3 771)
+  now sits just under the ~3 775-cycle gap between frames. It is right on
+  the edge: the pool was found empty 570 313 times and the DMA stopped
+  (`rbu` 570 310), but the ISR re-armed it at once each time (main-loop
+  refills only 8) and the MAC RX FIFO held the waiting frames: no overflow.
+- My prediction was ~1.4 % loss (1 330 + 2 500 = 3 830 cycles). It came out
+  lower because `EXTRA_CYCLES` spins on the cycle counter (wall time):
+  an ISR that interrupts the spin is hidden inside it instead of adding to
+  it (main 3 346, not 901 + 2 500). The HAL run had the same effect, so the
+  comparison stays fair.
+- Total so far: whole cost per frame **3 656 (`-O0`, HAL) → 1 660 (`-O2`)
+  → 1 330 (`-O2` + lean driver)**.
+- What is left in the 429-cycle ISR: interrupt entry/exit, the timing
+  around it, and the HAL's `HAL_ETH_IRQHandler()` dispatcher, which reads 4
+  peripheral registers (MAC, DMA, EXTI) per interrupt before calling us.
+  Next candidate: our own dispatch (read `DMACSR` once), step 3b.
+
+### Phase 5, step 3b: own ETH interrupt handler
+
+**Why:** `HAL_ETH_IRQHandler()` reads 4 peripheral registers (`MACISR`,
+`DMACSR`, `DMACIER`, `EXTI PR3`) on every interrupt before it calls our RX
+code, and each one is a slow bus read. In our setup only DMA events are
+enabled and the enable mask never changes (interrupt mode), so the DMA
+status register alone says what happened.
+
+**What (`eth_rx_irq_handler()` in `eth_rx.c`, `ETH_RX_OWN_IRQ`, default 1
+with the lean driver):**
+- read `DMACSR` once, then write back exactly the bits that were set
+  (write 1 to clear). A bit the DMA sets after the read stays set and
+  raises a new interrupt, so nothing is lost. Clearing first also gives a
+  frame that finishes during the harvest its own interrupt.
+- `RI` (frame received): `rx_harvest()`. `RBU` (no buffer): counted, as
+  before. `FBE` (fatal bus error): ETH interrupts off and driver state set
+  to error, the same as the HAL does.
+- Safety net: an interrupt with neither summary bit (`NIS` / `AIS`) set is
+  not a DMA event (MAC, wake-up; none is enabled today), so it goes to
+  `HAL_ETH_IRQHandler()`, which finds and clears its source.
+- Called from the `USER CODE` block of `ETH_IRQHandler()`
+  (`stm32h7xx_it.c`), so CubeMX regeneration keeps it.
+- Interrupt mode only (`#error` with NAPI, which switches `RIE` on and off).
+  `make -f firmware.mk OPT=-O2 OWNIRQ=0` builds the lean driver with the
+  HAL handler (`build/fw-O2-halirq/`). The boot line says which one runs.
+
+**Correctness** (`putty_irq3b.log`, per-frame log on): `malformed --count 1`
+gives malformed +9, bad-checksum +2, passed +1, with the same `[hw: ...]`
+tags as before.
+
+**Speed**, `-O2`, log OFF, ~145 700 frames/s:
+
+| Run (log) | IRQ handler | ISR + main = cycles/frame | CPU busy | Lost |
+|---|---|---|---|---|
+| Line rate, 1.5 M frames (`putty_lean_speed.log`) | HAL | 429 + 901 = 1 330 | 35 % | 0 |
+| Line rate, 1.5 M frames (`putty_irq3b.log`) | own | **357** + 902 = **1 259** | 33 % | 0 |
+| +2 500 extra, 1.5 M frames (`putty_lean_x2500.log`) | HAL | 425-520 + 3 251-3 346 = 3 771 | | 0 |
+| +2 500 extra, 1.5 M frames (`putty_irq3b_x2500.log`) | own | 353-400 + 3 373-3 391 = 3 744-3 773 | | **0** |
+
+- **The ISR got 72 cycles (17 %) cheaper (429 → 357)**: the 3 skipped
+  register reads plus the HAL's call chain. The main loop did not change
+  (902), so the saving is the handler alone.
+- **Total so far: whole cost per frame 3 656 (`-O0`, HAL) → 1 660 (`-O2`)
+  → 1 330 (lean driver) → 1 259 (own IRQ handler)**, i.e. ISR 776 → 357
+  over steps 3 and 3b.
+- Overload: still 0 lost, on the edge as before (pool empty 1 454 479 times,
+  `rbu` 300 674, main-loop refills 12, no FIFO overflow). The ISR costs a
+  bit more there (400) because of the extra RBU interrupts.
+- **Measurement finding:** in the overload run the main loop never left its
+  RX loop for the whole ~10 s burst, because a frame was always waiting. So
+  (1) the 5 s stats print was skipped until the burst ended, and (2) the
+  32-bit cycle delta of that one main-loop pass wrapped (2^32 cycles =
+  7.8 s): the raw line said `main 420`. Corrected: 420 + 2^32 / 1 454 589
+  frames = 3 373. Same root cause for both: the RX loop had no per-pass
+  limit, fixed in step 3c.
+
+### Phase 5, step 3c: frame budget per main-loop pass
+
+**Fix (`main.c`, `MAIN_RX_BUDGET` = 16, the whole pool):** one main-loop
+pass handles at most 16 frames, then does its other work (refill, button,
+MAC drop counters, stats) and starts a new pass. The budget is checked
+before `eth_rx_pop()`, so no frame is popped and then skipped. Frames left
+over wait in `pkt_ring`. At line rate a pass sees ~1 frame, so only
+overload is affected.
+
+**Test:** same overload as step 3b (`putty_budget_x2500.log`, +2 500 extra
+cycles, 1.5 M frames, log OFF):
+
+| | Step 3b (no budget) | Step 3c (budget 16) |
+|---|---|---|
+| Stats lines during the ~10 s burst | 1, after the burst | 3, on time (609 k / 729 k / 162 k frames) |
+| main cycles/frame (raw line) | 420 (wrapped) | 3 383-3 389 (real) |
+| Whole cost/frame | 3 744-3 773 | 3 743-3 763 |
+| Lost / FIFO overflow | 0 / 0 | 0 / 0 |
+| Pool found empty / `rbu` / main-loop refills | 1 454 479 / 300 674 / 12 | 309 864 / 90 495 / 18 262 |
+
+- The stats print and the button now run during overload, and the cost
+  numbers are real (no wrap). The extra work every 16 frames costs nothing
+  measurable (whole cost unchanged).
+- Bonus: main now re-arms descriptors every 16 frames (refills 12 →
+  18 262), so the DMA stopped for lack of a buffer 3x less often (`rbu`
+  300 674 → 90 495).
 
 ## BBB test link
 
@@ -783,8 +1071,16 @@ in `Debug/`, which is not in git, so CI uses this one. Both builds give
 identical section sizes.
 
 ```
-make -f firmware.mk        # -> build/fw/STM32-SmartNIC.elf (Windows: mingw32-make)
+make -f firmware.mk            # -> build/fw/STM32-SmartNIC.elf (-O0; Windows: mingw32-make)
+make -f firmware.mk OPT=-O2    # -> build/fw-O2/STM32-SmartNIC.elf (optimised)
+make -f firmware.mk OPT=-O2 EXTRA=1000   # headroom test build -> build/fw-O2-x1000/
+make -f firmware.mk OPT=-O2 NAPI=1       # NAPI-style polling RX -> build/fw-O2-napi/
+make -f firmware.mk OPT=-O2 LEAN=0       # ST HAL RX path instead of the lean driver -> build/fw-O2-hal/
+make -f firmware.mk OPT=-O2 OWNIRQ=0     # lean driver + HAL_ETH_IRQHandler -> build/fw-O2-halirq/
 ```
+
+Each optimisation level gets its own build folder, so object files from the
+two builds never mix.
 
 Needs `arm-none-eabi-gcc` in `PATH` (Ubuntu: `apt install gcc-arm-none-eabi
 libnewlib-arm-none-eabi`; or the one inside STM32CubeIDE's
@@ -800,7 +1096,7 @@ check:
 | Host unit tests | parser, filter and policy tests built with AddressSanitizer + UBSan |
 | Ring buffer, 2 threads | producer and consumer threads push/pop 2 000 000 descriptors under ThreadSanitizer: no lost, duplicated or torn descriptor, no data race |
 | Tools syntax | every Python script under `tools/` compiles (`py_compile`) and every shell script parses (`sh -n`), so a typo is caught before it reaches the BBB |
-| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`); the `.elf` and `.map` are kept as a download |
+| Firmware build | the full firmware compiles for the Cortex-M7 with no warnings (`-Werror`), both at `-O0` and at `-O2` (`-O2` analyses more and can warn where `-O0` is silent); both `.elf` and `.map` files are kept as a download |
 
 ## Project layout
 
@@ -808,7 +1104,7 @@ check:
 Core/Inc, Core/Src
   ring_buffer.[ch]       SPSC ring buffer
   ring_buffer_test.[ch]  on-target self-test
-  eth_rx.[ch]            RX buffer pool, HAL ETH callbacks, rings glue, MAC checksum report
+  eth_rx.[ch]            RX buffer pool, lean RX descriptor driver + own ETH IRQ handler (HAL paths kept), rings glue, MAC checksum report
   pkt_flags.h            per-frame status bits from the MAC (PKT_FLAG_*)
   perf.[ch]              DWT cycle counter: cycles per frame, min / avg / max, ETH ISR total
   uart_log.[ch]          non-blocking printf: RAM ring + USART3 TX interrupt
@@ -836,10 +1132,19 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
   edge test 1); no frame is lost only because the MAC's RX FIFO covers the
   gap. More stats text, or more work per frame, would need a bigger pool
   (limited by the 32 KB D2 SRAM) or printing the stats in smaller pieces.
-- At line rate the CPU is ~96 % busy (`-O0` build): only ~250-500 spare
-  cycles per frame (edge test 2), so heavier rules would lose frames at
-  line rate until the RX path is optimised (`-O2`, lighter driver path).
-- Only 4 RX DMA descriptors (CubeMX default); to be tuned during stress testing.
+- At line rate the CPU is ~96 % busy in the `-O0` build (only ~250-500
+  spare cycles per frame, edge test 2), ~43 % in the `-O2` build and ~33 %
+  with the lean RX driver and our own ETH interrupt handler.
+- Our ETH interrupt handler assumes only DMA interrupts are enabled; any
+  other source is passed to `HAL_ETH_IRQHandler()`.
+- Only 4 RX DMA descriptors (CubeMX default; `ETH_RX_DESC_CNT` sits in a
+  CubeMX-generated part of `stm32h7xx_hal_conf.h`). Enough in interrupt
+  mode, too few for NAPI-style polling (the DMA stops while main is busy).
+- The lean RX driver assumes one buffer per frame (1536-byte buffers) and
+  no timestamps. A descriptor that breaks this is passed on with length 0
+  and counted as malformed instead of being reassembled.
+- NAPI-style polling RX is in the code but off by default: it measured
+  slower on this MCU (Phase 5, step 2).
 - The parser handles untagged Ethernet + IPv4 only; VLAN-tagged frames and
   IPv6 are classified by EtherType but not parsed further.
 - The filter is stateless (no connection tracking): ACK / FIN+ACK scans look
@@ -862,5 +1167,6 @@ STM32-SmartNIC.ioc       CubeMX configuration (clocks, ETH, MPU, NVIC)
 - With the per-frame log on, `printf` at 115200 baud (~140 lines/s) limits how
   fast frames can be processed; turn it off with the USER button for
   throughput tests.
-- Cycle numbers come from the Debug build (`-O0`, no optimisation); an
-  optimised build will be faster.
+- Most cycle numbers in Performance come from the Debug build (`-O0`, no
+  optimisation); the `-O2` section shows the optimised numbers
+  (about 2-3x faster).

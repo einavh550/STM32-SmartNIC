@@ -23,6 +23,46 @@
  *  16 x 1536 = 24 KB, which fits in the 32 KB of D2 SRAM next to the descriptors. */
 #define ETH_RX_BUF_COUNT    (16u)
 
+/** RX mode (Phase 5, step 2).
+ *  1 = NAPI-style polling: the ETH interrupt only wakes the main loop and
+ *      switches itself off; main reads the frames (eth_rx_poll()) and turns
+ *      the interrupt back on when nothing is left.
+ *  0 = interrupt mode (DEFAULT): the ISR reads every frame itself.
+ *  Measured (README, Phase 5 step 2): NAPI is SLOWER on this MCU (1783 vs
+ *  1683 cycles/frame at line rate; 6.8 % vs 2.3 % loss under overload),
+ *  because a Cortex-M7 interrupt is cheap and with only 4 RX descriptors the
+ *  DMA starves while main is busy. Kept as an option: make ... NAPI=1 */
+#ifndef ETH_RX_NAPI
+#define ETH_RX_NAPI         (0)
+#endif
+
+/** Most frames eth_rx_poll() reads in one call, so a flood cannot keep the
+ *  main loop away from its other work (stats, button) forever. */
+#define ETH_RX_POLL_BUDGET  (8u)
+
+/** RX driver (Phase 5, step 3).
+ *  1 = lean driver (DEFAULT): our own short loop reads finished descriptors
+ *      and re-arms them; HAL_ETH_ReadData() is not used after start-up.
+ *  0 = the ST HAL path (HAL_ETH_ReadData + callbacks), kept to compare.
+ *      Build: make ... LEAN=0 */
+#ifndef ETH_RX_LEAN
+#define ETH_RX_LEAN         (1)
+#endif
+
+/** ETH interrupt handler (Phase 5, step 3b).
+ *  1 = our own handler (DEFAULT with the lean driver): reads the DMA status
+ *      register (DMACSR) ONCE and handles RX / RBU directly.
+ *  0 = HAL_ETH_IRQHandler(), which first reads MACISR, DMACSR, DMACIER and
+ *      EXTI PR3 on every interrupt. Build: make ... OWNIRQ=0
+ *  Interrupt mode only: NAPI switches RIE on and off, which our handler
+ *  does not check. */
+#ifndef ETH_RX_OWN_IRQ
+#define ETH_RX_OWN_IRQ      ((ETH_RX_LEAN != 0) && (ETH_RX_NAPI == 0))
+#endif
+#if ETH_RX_OWN_IRQ && ETH_RX_NAPI
+#error "ETH_RX_OWN_IRQ needs interrupt mode (ETH_RX_NAPI 0)"
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                */
 /* ------------------------------------------------------------------------- */
@@ -32,6 +72,13 @@
  * @note   Call once from main AFTER MX_ETH_Init() and BEFORE HAL_ETH_Start_IT().
  */
 void eth_rx_init(void);
+
+/**
+ * @brief  Start the ETH MAC + DMA with RX interrupts (wraps HAL_ETH_Start_IT())
+ *         and, in lean mode, take over the RX descriptor ring from the HAL.
+ * @note   Call once from main after eth_rx_init(). Returns false on error.
+ */
+bool eth_rx_start(void);
 
 /**
  * @brief  Give a buffer back to the pool after the frame in it was processed.
@@ -90,5 +137,21 @@ void eth_rx_get_stats(eth_rx_stats_t *out);
  *  then start a new period. The "free bufs" number above is only a snapshot
  *  at print time; this is the real low point in between. */
 uint32_t eth_rx_take_period_low(void);
+
+/** Main loop: read up to ETH_RX_POLL_BUDGET finished frames into the packet
+ *  ring (then eth_rx_pop() them as before). Does nothing until the ETH
+ *  interrupt has said "work is waiting". Returns the number of frames read.
+ *  In the old mode (ETH_RX_NAPI 0) it always returns 0: the ISR reads. */
+uint32_t eth_rx_poll(uint32_t budget);
+
+/** RX interrupts taken since boot. frames / irqs = how many frames one
+ *  interrupt paid for (batching). */
+uint32_t eth_rx_irq_count(void);
+
+#if ETH_RX_OWN_IRQ
+/** The whole ETH interrupt, called from ETH_IRQHandler() instead of
+ *  HAL_ETH_IRQHandler(). */
+void eth_rx_irq_handler(void);
+#endif
 
 #endif /* INC_ETH_RX_H_ */

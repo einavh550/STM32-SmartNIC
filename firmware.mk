@@ -4,13 +4,49 @@
 # of Windows paths), so CI cannot use it. This file builds the same .elf with
 # the same compiler flags as the CubeIDE Debug configuration.
 #
-#   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf
+#   make -f firmware.mk          # build build/fw/STM32-SmartNIC.elf (-O0, like CubeIDE Debug)
+#   make -f firmware.mk OPT=-O2  # optimised build in build/fw-O2/ (Phase 5 measurements)
+#   make -f firmware.mk OPT=-O2 EXTRA=1000  # headroom test build in build/fw-O2-x1000/
+#   make -f firmware.mk OPT=-O2 NAPI=1      # NAPI-style polling RX in build/fw-O2-napi/
+#   make -f firmware.mk OPT=-O2 LEAN=0      # ST HAL RX path (no lean driver) in build/fw-O2-hal/
+#   make -f firmware.mk OPT=-O2 OWNIRQ=0    # lean driver + HAL_ETH_IRQHandler in build/fw-O2-halirq/
 #   make -f firmware.mk clean
 #
 # Needs arm-none-eabi-gcc in PATH.
 
 TARGET   := STM32-SmartNIC
+# Optimisation level. -O0 matches CubeIDE Debug; any other level gets its
+# own build folder so the two builds never mix object files.
+OPT      ?= -O0
+ifeq ($(OPT),-O0)
 BUILD    := build/fw
+else
+BUILD    := build/fw$(OPT)
+endif
+# CPU headroom test: fake cycles per frame (main.c EXTRA_CYCLES). Each value
+# gets its own build folder too, e.g. build/fw-O2-x1000/.
+EXTRA    ?=
+ifneq ($(EXTRA),)
+BUILD    := $(BUILD)-x$(EXTRA)
+endif
+# RX mode (eth_rx.h ETH_RX_NAPI): empty = default (interrupt mode),
+# 1 = NAPI-style polling in its own folder (measured slower, kept to compare).
+NAPI     ?=
+ifeq ($(NAPI),1)
+BUILD    := $(BUILD)-napi
+endif
+# RX driver (eth_rx.h ETH_RX_LEAN): empty = default (lean driver),
+# 0 = the ST HAL path in its own folder, for the before/after numbers.
+LEAN     ?=
+ifeq ($(LEAN),0)
+BUILD    := $(BUILD)-hal
+endif
+# ETH interrupt handler (eth_rx.h ETH_RX_OWN_IRQ): empty = default (our own
+# handler with the lean driver), 0 = HAL_ETH_IRQHandler() in its own folder.
+OWNIRQ   ?=
+ifeq ($(OWNIRQ),0)
+BUILD    := $(BUILD)-halirq
+endif
 LDSCRIPT := STM32H723ZGTX_FLASH.ld
 
 CC   := arm-none-eabi-gcc
@@ -25,6 +61,18 @@ S_SRCS := Core/Startup/startup_stm32h723zgtx.s
 CPU := -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
 
 DEFS := -DDEBUG -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx
+ifneq ($(EXTRA),)
+DEFS += -DEXTRA_CYCLES=$(EXTRA)u
+endif
+ifneq ($(NAPI),)
+DEFS += -DETH_RX_NAPI=$(NAPI)
+endif
+ifneq ($(LEAN),)
+DEFS += -DETH_RX_LEAN=$(LEAN)
+endif
+ifneq ($(OWNIRQ),)
+DEFS += -DETH_RX_OWN_IRQ=$(OWNIRQ)
+endif
 
 INCS := -ICore/Inc \
         -IDrivers/STM32H7xx_HAL_Driver/Inc \
@@ -34,7 +82,7 @@ INCS := -ICore/Inc \
         -IDrivers/CMSIS/Include
 
 # Same as CubeIDE Debug, plus -Werror: in CI any warning fails the build.
-CFLAGS := $(CPU) -std=gnu11 -g3 -O0 $(DEFS) $(INCS) \
+CFLAGS := $(CPU) -std=gnu11 -g3 $(OPT) $(DEFS) $(INCS) \
           -ffunction-sections -fdata-sections -Wall -Werror \
           --specs=nano.specs -MMD -MP
 
